@@ -141,7 +141,10 @@ class StatefulExecutor:
         self,
         db_pool: Any,
         thread_id: str,
-        allow_net: bool = False,
+        *,
+        vfs_id: str | None = None,
+        allow_net: bool | list[str] = False,
+        enable_debugger: bool = False,
         timeout_seconds: float = 60.0,
     ):
         """Initialize stateful executor.
@@ -149,12 +152,22 @@ class StatefulExecutor:
         Args:
             db_pool: PostgreSQL connection pool
             thread_id: Thread identifier for this session
+            vfs_id: Optional shared VFS identifier
             allow_net: Allow network access in Python code
+            enable_debugger: Enable Deno debugger
             timeout_seconds: Execution timeout
         """
         self.db_pool = db_pool
         self.thread_id = thread_id
-        self.executor = SandboxExecutor(db_pool, thread_id, allow_net=allow_net, stateful=True)
+        self.vfs_id = vfs_id or thread_id
+        self.executor = SandboxExecutor(
+            db_pool, 
+            thread_id, 
+            vfs_id=self.vfs_id,
+            allow_net=allow_net, 
+            enable_debugger=enable_debugger,
+            stateful=True
+        )
         self.recovery = SessionRecovery(db_pool)
         self.manager = SandboxManager(db_pool)
 

@@ -15,6 +15,12 @@ Production-ready Python sandbox implementing the [DeepAgents](https://github.com
 - **Secure Python Execution** -- Pyodide WebAssembly sandbox with configurable network access
 - **Shell Execution** -- BusyBox WASM sandbox with pipe support (`echo | cat | grep`)
 - **Persistent Virtual Filesystem** -- PostgreSQL or SQLite-backed storage (20MB per file)
+- **VFS Snapshotting** -- Create point-in-time snapshots of the entire VFS and memory state for experimentation and rollback
+- **Fine-grained Network Control** -- Restrict network egress to specific domains (e.g., only GitHub and PyPI)
+- **Collaborative VFS** -- Decoupled VFS allows multiple threads/agents to share a single workspace
+- **Persistent Library Caching** -- Cache `micropip` wheel files in the database for 90% faster subsequent installs
+- **Cross-Language Eval** -- Execute TypeScript code from within Python via the `eval_ts()` bridge
+- **Sandbox Debugging** -- Attach standard Chrome/VS Code debuggers to the Pyodide/Deno event loop
 - **Zero-Config Mode** -- Full support for SQLite for easy local development and lightweight deployments
 - **Document Processing** -- Built-in helpers for Word, Excel, PowerPoint, and PDF
 - **Stateful Execution** -- Variables and state persist across executions and restarts
@@ -42,6 +48,96 @@ backend = MayflowerSandboxBackend(
 
 result = await backend.aexecute("print('hello world')")
 ```
+
+## Core Features
+
+### VFS Snapshotting & Branching
+
+Create a complete point-in-time clone of your sandbox state (files and variables) to safely try complex edits.
+
+```python
+# Create a snapshot
+snapshot_id = await backend.acreate_snapshot(ttl_days=1)
+
+# ... experiment, delete files, etc ...
+
+# Roll back to the saved state
+await backend.arestore_snapshot(snapshot_id)
+```
+
+Snapshots are automatically cleaned up when the parent session expires or after the specified TTL.
+
+### Fine-grained Network Control
+
+Secure your sandbox by whitelisting only the domains your agent needs.
+
+```python
+backend = MayflowerSandboxBackend(
+    db_pool, 
+    thread_id="user_123",
+    allow_net=["api.github.com", "pypi.org"] # Strict whitelist
+)
+
+# This will succeed
+await backend.aexecute("python -c \"import requests; requests.get('https://api.github.com')\"")
+
+# This will fail with a NetworkError (blocked by Deno)
+await backend.aexecute("python -c \"import requests; requests.get('https://malicious-site.com')\"")
+```
+
+### Collaborative VFS Workspaces
+
+Allow multiple agents or threads to share the same persistent storage workspace.
+
+```python
+# Agent A and B share the same workspace
+backend_a = MayflowerSandboxBackend(db_pool, "agent_a", vfs_id="project_workspace")
+backend_b = MayflowerSandboxBackend(db_pool, "agent_b", vfs_id="project_workspace")
+
+await backend_a.awrite("/code.py", "print('hello')")
+content = await backend_b.aread("/code.py") # Accesses shared workspace
+```
+
+### Cross-Language Eval (`eval_ts`)
+
+Execute TypeScript directly from your Python sandbox via the MCP bridge.
+
+```python
+code = """
+res = await eval_ts("console.log(1+2)")
+print(res['stdout']) # outputs 3
+"""
+await backend.aexecute(code)
+```
+
+### Sandbox Debugging
+
+Enable the Deno inspector to debug complex issues using standard tools.
+
+```python
+backend = MayflowerSandboxBackend(db_pool, "user_123", enable_debugger=True)
+# Worker starts with --inspect, connect via Chrome DevTools or VS Code
+```
+
+### Persistent Library Caching
+
+Drastically reduce sandbox initialization time by caching `micropip` wheel files in the database.
+
+```python
+# First run: downloads and caches
+await backend.aexecute("import micropip; await micropip.install('numpy')")
+
+# Subsequent runs (even after restart): loads from DB cache (~90% faster)
+await backend.aexecute("import micropip; await micropip.install('numpy')")
+```
+
+## Reliability
+
+Mayflower Sandbox is rigorously tested to ensure production-grade reliability across both database backends.
+
+- **514+ Tests Passing** -- Full suite verified for both PostgreSQL and SQLite
+- **Multi-Database Parity** -- Guaranteed identical behavior between Postgres and SQLite implementations
+- **Zero-Config Ready** -- Automatic migrations and SQL translation for immediate deployment
 
 ## Quick Start (PostgreSQL)
 

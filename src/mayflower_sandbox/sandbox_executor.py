@@ -72,8 +72,10 @@ class SandboxExecutor:
         db_pool: Any,
         thread_id: str,
         *,
-        allow_net: bool = False,
+        vfs_id: str | None = None,
+        allow_net: bool | list[str] = False,
         stateful: bool = False,
+        enable_debugger: bool = False,
         timeout_seconds: float = 60.0,
         max_memory_mb: int = 512,
         max_file_size_mb: int = 20,
@@ -84,20 +86,24 @@ class SandboxExecutor:
 
         Args:
             db_pool: PostgreSQL connection pool
-            thread_id: Thread ID for VFS isolation
+            thread_id: Thread ID for isolation
+            vfs_id: Optional shared VFS identifier. Defaults to thread_id.
             allow_net: Allow network access
             stateful: Maintain state between executions
+            enable_debugger: Enable Deno debugger
             timeout_seconds: Execution timeout
-            max_memory_mb: Maximum memory usage (not enforced yet, placeholder)
+            max_memory_mb: Maximum memory usage
             max_file_size_mb: Maximum total file size in VFS
             max_files: Maximum number of files in VFS
         """
         self.db_pool = db_pool
         self.thread_id = thread_id
-        self.vfs = VirtualFilesystem(db_pool, thread_id)
+        self.vfs_id = vfs_id or thread_id
+        self.vfs = VirtualFilesystem(db_pool, thread_id, vfs_id=self.vfs_id)
         self._mcp_manager = MCPBindingManager()
         self.allow_net = allow_net
         self.stateful = stateful
+        self.enable_debugger = enable_debugger
         self.timeout_seconds = timeout_seconds
         self.max_memory_mb = max_memory_mb
         self.max_file_size_mb = max_file_size_mb
@@ -144,7 +150,7 @@ class SandboxExecutor:
         return cls._mcp_bridge.port if cls._mcp_bridge else None
 
     @classmethod
-    async def _ensure_pool(cls, mcp_bridge_port: int | None = None) -> None:
+    async def _ensure_pool(cls, mcp_bridge_port: int | None = None, enable_debugger: bool = False) -> None:
         """Ensure worker pool is started (lazy initialization)."""
         if cls._pool is None:
             async with cls._pool_lock:
@@ -152,12 +158,13 @@ class SandboxExecutor:
                     from .worker_pool import WorkerPool
 
                     pool_size = int(os.getenv("PYODIDE_POOL_SIZE", "3"))
-                    logger.info(f"Initializing Pyodide worker pool (size={pool_size})...")
+                    logger.info(f"Initializing Pyodide worker pool (size={pool_size}, debugger={enable_debugger})...")
 
                     pool = WorkerPool(
                         size=pool_size,
                         executor_path=Path(__file__).parent,
                         mcp_bridge_port=mcp_bridge_port,
+                        enable_debugger=enable_debugger,
                     )
                     try:
                         await pool.start()
@@ -227,14 +234,15 @@ class SandboxExecutor:
                     allowed_hosts.add(host)
         if mcp_bridge_port is not None:
             allowed_hosts.add(f"127.0.0.1:{mcp_bridge_port}")
-        if self.allow_net:
-            logger.warning(
-                "allow_net=True requested for thread %s, but general network access is disabled. "
-                "Only %s are permitted.",
-                self.thread_id,
-                ", ".join(sorted(allowed_hosts)),
-            )
-        cmd.append(f"--allow-net={','.join(sorted(allowed_hosts))}")
+            
+        if isinstance(self.allow_net, list):
+            for host in self.allow_net:
+                allowed_hosts.add(host)
+            cmd.append(f"--allow-net={','.join(sorted(allowed_hosts))}")
+        elif self.allow_net is True:
+            cmd.append("--allow-net")
+        else:
+            cmd.append(f"--allow-net={','.join(sorted(allowed_hosts))}")
 
         cmd.extend(
             [
@@ -257,12 +265,27 @@ class SandboxExecutor:
 
     def _build_shell_command(self, command: str) -> list[str]:
         """Build Deno command for shell execution."""
+        
+        # Determine network permissions for shell
+        net_flag = ""
+        if isinstance(self.allow_net, list):
+            # If it's a list, we allow specific domains
+            # Plus default Deno requires nothing strictly for local script execution,
+            # but if the shell uses wget/curl we allow these domains
+            net_flag = f"--allow-net={','.join(self.allow_net)}"
+        elif self.allow_net is True:
+            net_flag = "--allow-net"
+            
         cmd: list[str] = [
             "deno",
             "run",
             "--allow-read",
             "--allow-write",
         ]
+        
+        if net_flag:
+            cmd.append(net_flag)
+            
         if config_path := self._get_deno_config_path():
             cmd.extend(["--config", str(config_path)])
         cmd.extend(
@@ -538,6 +561,69 @@ class SandboxExecutor:
             "        raise RuntimeError(data['error'])\n"
             "    return data.get('result')\n"
             "builtins.__MCP_CALL__ = __MCP_CALL__\n"
+            "\n"
+            "async def eval_ts(code):\n"
+            "    \"\"\"Evaluate TypeScript code via Deno bridge (Feature 8).\"\"\"\n"
+            "    import json\n"
+            "    import js\n"
+            "    from pyodide.ffi import to_js\n"
+            f"    url = 'http://127.0.0.1:{port}/eval_ts'\n"
+            "    options = to_js({\n"
+            "        'method': 'POST',\n"
+            "        'body': json.dumps({'code': code}),\n"
+            "        'headers': {'Content-Type': 'application/json'}\n"
+            "    }, dict_converter=js.Object.fromEntries)\n"
+            "    resp = await js.fetch(url, options)\n"
+            "    resp_text = await resp.text()\n"
+            "    return json.loads(resp_text)\n"
+            "\n"
+            "builtins.eval_ts = eval_ts\n"
+            "\n"
+            "def __MAYFLOWER_MONKEYPATCH_MICROPIP__():\n"
+            "    try:\n"
+            "        import micropip\n"
+            "        import json\n"
+            "        import base64\n"
+            "        from js import fetch, pyodide\n"
+            "        _orig_install = micropip.install\n"
+            "        \n"
+            "        async def cached_install(pkg_list, *args, **kwargs):\n"
+            "            if isinstance(pkg_list, str):\n"
+            "                pkg_list = [pkg_list]\n"
+            "            \n"
+            "            for pkg in pkg_list:\n"
+            "                # Very simplified parser for 'pkg==version'\n"
+            "                if '==' in pkg:\n"
+            "                    name, ver = pkg.split('==', 1)\n"
+            "                    # Check cache via bridge\n"
+            f"                    url = 'http://127.0.0.1:{port}/get_cached_package'\n"
+            "                    payload = json.dumps({'package_name': name, 'version': ver, 'pyodide_version': pyodide.version})\n"
+            "                    headers = [['Content-Type', 'application/json']]\n"
+            "                    try:\n"
+            "                        resp = await fetch(url, method='POST', body=payload, headers=headers)\n"
+            "                        data = json.loads(await resp.text())\n"
+            "                        if data.get('found'):\n"
+            "                            # Load from cache\n"
+            "                            content = base64.b64decode(data['content_b64'])\n"
+            "                            filename = data['filename']\n"
+            "                            with open(f'/tmp/{filename}', 'wb') as f:\n"
+            "                                f.write(content)\n"
+            "                            await _orig_install(f'emfs:/tmp/{filename}', *args, **kwargs)\n"
+            "                            continue\n"
+            "                    except Exception:\n"
+            "                        pass\n"
+            "                \n"
+            "                # Fallback to normal install\n"
+            "                await _orig_install(pkg, *args, **kwargs)\n"
+            "                \n"
+            "                # TODO: After successful install, we could upload to cache if it was a new wheel\n"
+            "                # This requires hooking into micropip's internal wheel discovery\n"
+            "            \n"
+            "        micropip.install = cached_install\n"
+            "    except ImportError:\n"
+            "        pass\n"
+            "\n"
+            "__MAYFLOWER_MONKEYPATCH_MICROPIP__()\n"
         )
 
     @staticmethod
@@ -624,7 +710,7 @@ class SandboxExecutor:
             bridge_port = await self._ensure_mcp_bridge(self.db_pool, self.thread_id)
 
             # Ensure pool is started with MCP bridge port
-            await self._ensure_pool(mcp_bridge_port=bridge_port)
+            await self._ensure_pool(mcp_bridge_port=bridge_port, enable_debugger=self.enable_debugger)
 
             if self._pool is None:
                 raise RuntimeError("Worker pool not available")

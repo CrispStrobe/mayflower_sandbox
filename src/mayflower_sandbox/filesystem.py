@@ -40,15 +40,17 @@ class VirtualFilesystem:
 
     MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB
 
-    def __init__(self, db_pool: Any, thread_id: str):
+    def __init__(self, db_pool: Any, thread_id: str, vfs_id: str | None = None):
         """Initialize filesystem for specific thread.
 
         Args:
             db_pool: PostgreSQL connection pool
             thread_id: Thread identifier for isolation
+            vfs_id: Optional shared VFS identifier. Defaults to thread_id.
         """
         self.db = db_pool
         self.thread_id = thread_id
+        self.vfs_id = vfs_id or thread_id
 
     async def ensure_session(self) -> None:
         """Ensure session exists in database for this thread_id.
@@ -61,11 +63,12 @@ class VirtualFilesystem:
         async with self.db.acquire() as conn:
             await conn.execute(
                 """
-                INSERT INTO sandbox_sessions (thread_id, expires_at, metadata)
-                VALUES ($1, NOW() + INTERVAL '1 day', '{}')
+                INSERT INTO sandbox_sessions (thread_id, expires_at, metadata, vfs_id)
+                VALUES ($1, NOW() + INTERVAL '1 day', '{}', $2)
                 ON CONFLICT (thread_id) DO NOTHING
                 """,
                 self.thread_id,
+                self.vfs_id,
             )
 
     def validate_path(self, file_path: str) -> str:
@@ -172,9 +175,9 @@ class VirtualFilesystem:
             result = await conn.fetchrow(
                 """
                 INSERT INTO sandbox_filesystem (
-                    thread_id, file_path, content, content_type, size
-                ) VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (thread_id, file_path)
+                    thread_id, vfs_id, file_path, content, content_type, size
+                ) VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (vfs_id, file_path)
                 DO UPDATE SET
                     content = EXCLUDED.content,
                     content_type = EXCLUDED.content_type,
@@ -183,13 +186,15 @@ class VirtualFilesystem:
                 RETURNING *
             """,
                 self.thread_id,
+                self.vfs_id,
                 normalized_path,
                 content,
                 content_type,
                 size,
             )
 
-            logger.debug(f"Wrote file {normalized_path} ({size} bytes) for thread {self.thread_id}")
+            logger.debug(f"Wrote file {normalized_path} ({size} bytes) for vfs {self.vfs_id}")
+            print(f"DEBUG: VFS {self.vfs_id} wrote {normalized_path} result_vfs={result['vfs_id'] if result else 'NONE'}")
 
             return dict(result) if result else {}
 
@@ -212,17 +217,19 @@ class VirtualFilesystem:
             result = await conn.fetchrow(
                 """
                 SELECT * FROM sandbox_filesystem
-                WHERE thread_id = $1 AND file_path = $2
+                WHERE vfs_id = $1 AND file_path = $2
             """,
-                self.thread_id,
+                self.vfs_id,
                 normalized_path,
             )
 
             if not result:
+                print(f"DEBUG: VFS {self.vfs_id} NOT FOUND {normalized_path}")
                 raise FileNotFoundError(
                     f"File {normalized_path} not found in thread {self.thread_id}"
                 )
 
+            print(f"DEBUG: VFS {self.vfs_id} read {normalized_path} result_vfs={result['vfs_id']}")
             return dict(result)
 
     async def delete_file(self, file_path: str) -> bool:
@@ -243,9 +250,9 @@ class VirtualFilesystem:
             result = await conn.execute(
                 """
                 DELETE FROM sandbox_filesystem
-                WHERE thread_id = $1 AND file_path = $2
+                WHERE vfs_id = $1 AND file_path = $2
             """,
-                self.thread_id,
+                self.vfs_id,
                 normalized_path,
             )
 
@@ -267,20 +274,20 @@ class VirtualFilesystem:
                 files = await conn.fetch(
                     """
                     SELECT * FROM sandbox_filesystem
-                    WHERE thread_id = $1 AND file_path LIKE $2
+                    WHERE vfs_id = $1 AND file_path LIKE $2
                     ORDER BY file_path
                 """,
-                    self.thread_id,
+                    self.vfs_id,
                     pattern,
                 )
             else:
                 files = await conn.fetch(
                     """
                     SELECT * FROM sandbox_filesystem
-                    WHERE thread_id = $1
+                    WHERE vfs_id = $1
                     ORDER BY file_path
                 """,
-                    self.thread_id,
+                    self.vfs_id,
                 )
 
             return [dict(f) for f in files]
@@ -301,10 +308,10 @@ class VirtualFilesystem:
                     """
                     SELECT EXISTS(
                         SELECT 1 FROM sandbox_filesystem
-                        WHERE thread_id = $1 AND file_path = $2
+                        WHERE vfs_id = $1 AND file_path = $2
                     )
                 """,
-                    self.thread_id,
+                    self.vfs_id,
                     normalized_path,
                 )
                 return result

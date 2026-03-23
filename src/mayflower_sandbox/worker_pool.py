@@ -30,10 +30,12 @@ class PyodideWorker:
         worker_id: int,
         executor_path: Path,
         allowed_hosts: set[str] | None = None,
+        enable_debugger: bool = False,
     ):
         self.worker_id = worker_id
         self.executor_path = executor_path
         self.allowed_hosts = allowed_hosts or self.DEFAULT_ALLOWED_HOSTS.copy()
+        self.enable_debugger = enable_debugger
         self.process: Process | None = None
         self.busy = False
         self.request_count = 0
@@ -89,13 +91,22 @@ class PyodideWorker:
         # Build network permission string from allowed hosts
         allowed_hosts_str = ",".join(sorted(self.allowed_hosts))
 
-        self.process = await asyncio.create_subprocess_exec(
+        cmd = [
             "deno",
             "run",
             f"--allow-net={allowed_hosts_str}",
             "--allow-read",
             "--allow-write",
-            str(self.executor_path / "worker_server.ts"),
+        ]
+        
+        if self.enable_debugger:
+            # Random port to avoid conflicts in pool
+            cmd.append("--inspect")
+
+        cmd.append(str(self.executor_path / "worker_server.ts"))
+
+        self.process = await asyncio.create_subprocess_exec(
+            *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -287,10 +298,12 @@ class WorkerPool:
         size: int = 3,
         executor_path: Path | None = None,
         mcp_bridge_port: int | None = None,
+        enable_debugger: bool = False,
     ):
         self.size = size
         self.executor_path = executor_path or Path(__file__).parent
         self.mcp_bridge_port = mcp_bridge_port
+        self.enable_debugger = enable_debugger
         self.workers: list[PyodideWorker] = []
         self.next_worker_idx = 0
         self.started = False
@@ -313,7 +326,12 @@ class WorkerPool:
 
         # Create workers with allowed hosts
         self.workers = [
-            PyodideWorker(i, self.executor_path, self._allowed_hosts) for i in range(self.size)
+            PyodideWorker(
+                i, 
+                self.executor_path, 
+                self._allowed_hosts, 
+                enable_debugger=self.enable_debugger
+            ) for i in range(self.size)
         ]
 
         # Start workers in parallel

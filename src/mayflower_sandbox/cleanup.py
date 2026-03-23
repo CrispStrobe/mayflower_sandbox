@@ -128,10 +128,10 @@ class CleanupJob:
 
             # Delete orphaned files
             await conn.execute("""
-                DELETE FROM sandbox_filesystem f
+                DELETE FROM sandbox_filesystem
                 WHERE NOT EXISTS (
-                    SELECT 1 FROM sandbox_sessions s
-                    WHERE s.thread_id = f.thread_id
+                    SELECT 1 FROM sandbox_sessions
+                    WHERE sandbox_sessions.thread_id = sandbox_filesystem.thread_id
                 )
             """)
 

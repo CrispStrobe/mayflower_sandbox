@@ -46,12 +46,14 @@ class SandboxManager:
         self,
         thread_id: str,
         metadata: dict | None = None,
+        vfs_id: str | None = None,
     ) -> dict:
         """Get existing session or create new one.
 
         Args:
             thread_id: Thread identifier
             metadata: Optional metadata for new session
+            vfs_id: Optional shared VFS identifier. Defaults to thread_id.
 
         Returns:
             Session record with all fields
@@ -74,23 +76,28 @@ class SandboxManager:
 
                 # Update last accessed
                 await self.update_last_accessed(thread_id)
+                
+                # If caller requested a specific vfs_id, and existing session has a different one,
+                # we should probably warn or update it. For now, we return existing.
                 return dict(session)
 
             # Create new session
+            effective_vfs_id = vfs_id or thread_id
             expires_at = datetime.now() + timedelta(days=self.default_expiration_days)
             session = await conn.fetchrow(
                 """
                 INSERT INTO sandbox_sessions (
-                    thread_id, expires_at, metadata
-                ) VALUES ($1, $2, $3::jsonb)
+                    thread_id, expires_at, metadata, vfs_id
+                ) VALUES ($1, $2, $3::jsonb, $4)
                 RETURNING *
             """,
                 thread_id,
                 expires_at,
                 json.dumps(metadata or {}),
+                effective_vfs_id,
             )
 
-            logger.info(f"Created new session for thread {thread_id}, expires {expires_at}")
+            logger.info(f"Created new session for thread {thread_id} (VFS: {effective_vfs_id}), expires {expires_at}")
             return dict(session) if session else {}
 
     async def get_session(self, thread_id: str) -> dict:
@@ -176,3 +183,145 @@ class SandboxManager:
             )
 
             return [dict(s) for s in sessions]
+
+    async def create_snapshot(self, thread_id: str, ttl_days: int = 1) -> str:
+        """Create a point-in-time snapshot of a session.
+
+        Args:
+            thread_id: Original thread to snapshot
+            ttl_days: How long the snapshot should live before auto-cleanup
+
+        Returns:
+            New snapshot thread_id
+        """
+        import uuid
+        snapshot_id = f"{thread_id}@snap_{uuid.uuid4().hex[:8]}"
+        expires_at = datetime.now() + timedelta(days=ttl_days)
+        
+        async with self.db.acquire() as conn:
+            # Check if parent exists
+            parent = await conn.fetchrow("SELECT * FROM sandbox_sessions WHERE thread_id = $1", thread_id)
+            if not parent:
+                raise SessionNotFoundError(f"Session {thread_id} not found")
+                
+            # 1. Create snapshot session
+            metadata = parent["metadata"]
+            if isinstance(metadata, str):
+                metadata = json.loads(metadata)
+            
+            parent_vfs_id = parent.get("vfs_id") or thread_id
+            
+            # Note: PostgreSQL requires columns to exist. If the migration hasn't run, 
+            # this will fail. We should handle it gracefully or rely on the user running migrations.
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO sandbox_sessions (
+                        thread_id, expires_at, metadata, parent_thread_id, vfs_id
+                    ) VALUES ($1, $2, $3::jsonb, $4, $5)
+                    """,
+                    snapshot_id,
+                    expires_at,
+                    json.dumps(metadata),
+                    thread_id,
+                    snapshot_id # Snapshot gets its own VFS by default to avoid accidental shared mutation
+                )
+            except Exception as e:
+                # If parent_thread_id doesn't exist yet (migration not run)
+                if "parent_thread_id" in str(e).lower() or "no column" in str(e).lower():
+                    raise RuntimeError("Database migration for VFS snapshots has not been applied. Please run migrations/004_vfs_snapshots.sql") from e
+                raise
+            
+            # 2. Copy filesystem (from parent VFS)
+            await conn.execute(
+                """
+                INSERT INTO sandbox_filesystem (
+                    thread_id, vfs_id, file_path, content, content_type, size, created_at, modified_at, metadata
+                )
+                SELECT $1, $1, file_path, content, content_type, size, created_at, modified_at, metadata
+                FROM sandbox_filesystem
+                WHERE vfs_id = $2
+                """,
+                snapshot_id, parent_vfs_id
+            )
+            
+            # 3. Copy session bytes
+            await conn.execute(
+                """
+                INSERT INTO sandbox_session_bytes (
+                    thread_id, session_bytes, session_metadata, updated_at
+                )
+                SELECT $1, session_bytes, session_metadata, updated_at
+                FROM sandbox_session_bytes
+                WHERE thread_id = $2
+                """,
+                snapshot_id, thread_id
+            )
+            
+        logger.info(f"Created snapshot {snapshot_id} from {thread_id}")
+        return snapshot_id
+
+    async def restore_snapshot(self, snapshot_id: str, target_thread_id: str | None = None) -> str:
+        """Restore a snapshot to a target session (or its parent).
+        
+        Args:
+            snapshot_id: The snapshot thread_id
+            target_thread_id: The thread to overwrite. If None, overwrites the parent.
+        """
+        async with self.db.acquire() as conn:
+            snap = await conn.fetchrow("SELECT * FROM sandbox_sessions WHERE thread_id = $1", snapshot_id)
+            if not snap:
+                raise SessionNotFoundError(f"Snapshot {snapshot_id} not found")
+                
+            # If the database doesn't have parent_thread_id, snap won't either.
+            target = target_thread_id or snap.get("parent_thread_id")
+            if not target:
+                raise ValueError("No target thread_id provided and snapshot has no parent.")
+                
+            # Make sure target exists
+            target_session = await conn.fetchrow("SELECT * FROM sandbox_sessions WHERE thread_id = $1", target)
+            if not target_session:
+                metadata = snap["metadata"]
+                if isinstance(metadata, str):
+                    metadata = json.loads(metadata)
+                expires_at = datetime.now() + timedelta(days=self.default_expiration_days)
+                await conn.execute(
+                    """
+                    INSERT INTO sandbox_sessions (thread_id, expires_at, metadata, vfs_id)
+                    VALUES ($1, $2, $3::jsonb, $4)
+                    """, target, expires_at, json.dumps(metadata), target # Restored gets its own VFS (overwritten below)
+                )
+                
+            target_vfs_id = target_session.get("vfs_id") if target_session else target
+                
+            # Delete existing target files and bytes
+            await conn.execute("DELETE FROM sandbox_filesystem WHERE vfs_id = $1", target_vfs_id)
+            await conn.execute("DELETE FROM sandbox_session_bytes WHERE thread_id = $1", target)
+            
+            # Copy from snapshot to target
+            await conn.execute(
+                """
+                INSERT INTO sandbox_filesystem (
+                    thread_id, vfs_id, file_path, content, content_type, size, created_at, modified_at, metadata
+                )
+                SELECT $1, $2, file_path, content, content_type, size, created_at, modified_at, metadata
+                FROM sandbox_filesystem
+                WHERE vfs_id = $3
+                """,
+                target, target_vfs_id, snapshot_id
+            )
+            
+            await conn.execute(
+                """
+                INSERT INTO sandbox_session_bytes (
+                    thread_id, session_bytes, session_metadata, updated_at
+                )
+                SELECT $1, session_bytes, session_metadata, updated_at
+                FROM sandbox_session_bytes
+                WHERE thread_id = $2
+                """,
+                target, snapshot_id
+            )
+            
+        logger.info(f"Restored snapshot {snapshot_id} to {target}")
+        return target

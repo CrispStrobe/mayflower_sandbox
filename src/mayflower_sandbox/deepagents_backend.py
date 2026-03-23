@@ -305,6 +305,19 @@ class PostgresBackend(BackendProtocol):
         return _format_line_numbers(selected, start_line=start_idx + 1)
 
     # -------------------------------------------------------------------------
+    # delete
+    # -------------------------------------------------------------------------
+
+    def delete(self, file_path: str) -> bool:
+        return self._run_async(self.adelete(file_path))
+
+    async def adelete(self, file_path: str) -> bool:
+        try:
+            return await self._vfs.delete_file(file_path)
+        except (FileNotFoundError, InvalidPathError):
+            return False
+
+    # -------------------------------------------------------------------------
     # write
     # -------------------------------------------------------------------------
 
@@ -567,8 +580,10 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
         db_pool: Any,
         thread_id: str,
         *,
-        allow_net: bool = False,
+        vfs_id: str | None = None,
+        allow_net: bool | list[str] = False,
         stateful: bool = True,
+        enable_debugger: bool = False,
         timeout_seconds: float = 60.0,
     ) -> None:
         """Initialize MayflowerSandboxBackend.
@@ -576,16 +591,23 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
         Args:
             db_pool: asyncpg connection pool for PostgreSQL.
             thread_id: Thread/session identifier for file and execution isolation.
+            vfs_id: Optional shared VFS identifier. Defaults to thread_id.
             allow_net: Whether to allow network access in Pyodide sandbox.
             stateful: Whether to maintain state between executions.
+            enable_debugger: Whether to enable Deno debugger (inspector).
             timeout_seconds: Execution timeout in seconds.
         """
         super().__init__(db_pool, thread_id)
+        self._vfs_id = vfs_id or thread_id
+        # Override the base _vfs which might have been initialized without vfs_id
+        self._vfs = VirtualFilesystem(db_pool, thread_id, vfs_id=self._vfs_id)
         self._executor = SandboxExecutor(
             db_pool,
             thread_id,
+            vfs_id=self._vfs_id,
             allow_net=allow_net,
             stateful=stateful,
+            enable_debugger=enable_debugger,
             timeout_seconds=timeout_seconds,
         )
         self._timeout_seconds = timeout_seconds
@@ -618,10 +640,46 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
         timeout = self._timeout_seconds + 10.0
         return future.result(timeout=timeout)
 
+    async def acreate_snapshot(self, ttl_days: int = 1) -> str:
+        """Create a point-in-time snapshot of the current session.
+        
+        Args:
+            ttl_days: How long the snapshot should live before auto-cleanup
+            
+        Returns:
+            New snapshot thread_id
+        """
+        from mayflower_sandbox.manager import SandboxManager
+        manager = SandboxManager(self.db_pool)
+        return await manager.create_snapshot(self.thread_id, ttl_days)
+        
+    def create_snapshot(self, ttl_days: int = 1) -> str:
+        """Create a point-in-time snapshot of the current session."""
+        return self._run_async(self.acreate_snapshot(ttl_days))
+        
+    async def arestore_snapshot(self, snapshot_id: str) -> None:
+        """Restore the current session from a snapshot.
+        
+        Args:
+            snapshot_id: The snapshot thread_id to restore from
+        """
+        from mayflower_sandbox.manager import SandboxManager
+        manager = SandboxManager(self.db_pool)
+        await manager.restore_snapshot(snapshot_id, target_thread_id=self.thread_id)
+        
+    def restore_snapshot(self, snapshot_id: str) -> None:
+        """Restore the current session from a snapshot."""
+        return self._run_async(self.arestore_snapshot(snapshot_id))
+
     @property
     def id(self) -> str:
         """Unique identifier for the sandbox backend instance."""
         return f"mayflower:{self._thread_id}"
+
+    @property
+    def vfs_id(self) -> str:
+        """Shared VFS identifier for this session."""
+        return self._vfs_id
 
     # -------------------------------------------------------------------------
     # execute (SandboxBackendProtocol)
@@ -838,6 +896,18 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
         if inline_code:
             logger.info("Routing python -c to Pyodide (%d chars)", len(inline_code))
             return await self._aexecute_python_code(inline_code)
+
+        # NEW: Heuristic for multi-line Python snippets (often sent by agents without 'python -c')
+        if (
+            "\n" in command.strip() 
+            or command.strip().startswith("import ") 
+            or command.strip().startswith("from ")
+            or "await " in command
+        ):
+            # Check if it might be a shell pipeline before deciding
+            if not ("|" in command and not ("'" in command or '"' in command)):
+                logger.info("Routing suspected Python snippet to Pyodide (%d chars)", len(command))
+                return await self._aexecute_python_code(command)
 
         # Handle python script.py (file-based execution)
         python_cmd = self._parse_python_command(command)

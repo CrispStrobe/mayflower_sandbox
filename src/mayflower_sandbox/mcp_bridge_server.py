@@ -228,6 +228,80 @@ class MCPBridgeServer:
             json.dumps({"result": result}, default=self._json_default).encode("utf-8"),
         )
 
+    async def _execute_ts_eval(self, code: str) -> tuple[str, bytes]:
+        """Evaluate TypeScript code via Deno (Feature 8)."""
+        import subprocess
+        try:
+            # We use subprocess here for a clean environment, 
+            # or we could try to use the same process if we were running in Deno.
+            # But the bridge is a Python process.
+            proc = await asyncio.create_subprocess_exec(
+                "deno", "eval", code,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            
+            result = {
+                "success": proc.returncode == 0,
+                "stdout": stdout.decode(errors="replace"),
+                "stderr": stderr.decode(errors="replace"),
+            }
+            return "200 OK", json.dumps(result).encode("utf-8")
+        except Exception as e:
+            return "500 Internal Server Error", json.dumps({"error": str(e)}).encode("utf-8")
+
+    async def _execute_cache_package(self, data: dict) -> tuple[str, bytes]:
+        """Store a package wheel in the cache (Feature 1)."""
+        import base64
+        try:
+            content = base64.b64decode(data["content_b64"])
+            async with self.db_pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO sandbox_package_cache (
+                        package_name, version, pyodide_version, filename, content
+                    ) VALUES ($1, $2, $3, $4, $5)
+                    ON CONFLICT (package_name, version, pyodide_version) DO UPDATE SET
+                        content = EXCLUDED.content,
+                        created_at = CURRENT_TIMESTAMP
+                    """,
+                    data["package_name"],
+                    data["version"],
+                    data["pyodide_version"],
+                    data["filename"],
+                    content
+                )
+            return "200 OK", json.dumps({"success": True}).encode("utf-8")
+        except Exception as e:
+            return "500 Internal Server Error", json.dumps({"error": str(e)}).encode("utf-8")
+
+    async def _execute_get_cached_package(self, data: dict) -> tuple[str, bytes]:
+        """Retrieve a package wheel from the cache (Feature 1)."""
+        import base64
+        try:
+            async with self.db_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT content, filename FROM sandbox_package_cache
+                    WHERE package_name = $1 AND version = $2 AND pyodide_version = $3
+                    """,
+                    data["package_name"],
+                    data["version"],
+                    data["pyodide_version"]
+                )
+                if row:
+                    result = {
+                        "found": True,
+                        "filename": row["filename"],
+                        "content_b64": base64.b64encode(row["content"]).decode("utf-8")
+                    }
+                else:
+                    result = {"found": False}
+            return "200 OK", json.dumps(result).encode("utf-8")
+        except Exception as e:
+            return "500 Internal Server Error", json.dumps({"error": str(e)}).encode("utf-8")
+
     async def _handle_request(
         self,
         reader: asyncio.StreamReader,
@@ -260,7 +334,17 @@ class MCPBridgeServer:
             payload = await reader.readexactly(content_length) if content_length > 0 else b""
 
             # Route request
-            if method != "POST" or path != "/call":
+            if method == "POST" and path == "/eval_ts":
+                data = json.loads(payload.decode("utf-8"))
+                code = data.get("code", "")
+                status, body = await self._execute_ts_eval(code)
+            elif method == "POST" and path == "/cache_package":
+                data = json.loads(payload.decode("utf-8"))
+                status, body = await self._execute_cache_package(data)
+            elif method == "POST" and path == "/get_cached_package":
+                data = json.loads(payload.decode("utf-8"))
+                status, body = await self._execute_get_cached_package(data)
+            elif method != "POST" or path != "/call":
                 status = "404 Not Found"
                 body = json.dumps({"error": "Endpoint not found"}).encode("utf-8")
             else:
