@@ -5,8 +5,9 @@ Provides endpoints for downloading files created by sandbox executions.
 """
 
 import logging
+from typing import Any
 
-import asyncpg
+
 from aiohttp import web
 
 from mayflower_sandbox.filesystem import FileNotFoundError as VFSFileNotFoundError
@@ -18,7 +19,7 @@ logger = logging.getLogger(__name__)
 class FileServer:
     """HTTP server for serving sandbox files."""
 
-    def __init__(self, db_pool: asyncpg.Pool, host: str = "0.0.0.0", port: int = 8080):  # nosec B104 - intentional for container deployment
+    def __init__(self, db_pool: Any, host: str = "0.0.0.0", port: int = 8080):  # nosec B104 - intentional for container deployment
         """Initialize file server.
 
         Args:
@@ -143,7 +144,7 @@ class FileServer:
 
 
 def create_file_server(
-    db_pool: asyncpg.Pool,
+    db_pool: Any,
     host: str = "0.0.0.0",  # nosec B104 - intentional for container deployment
     port: int = 8080,
 ) -> FileServer:

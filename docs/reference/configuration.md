@@ -2,7 +2,13 @@
 
 All environment variables, database schema, and tuning parameters for Mayflower Sandbox.
 
-## Environment Variables
+## Supported Databases
+
+Mayflower Sandbox supports both **PostgreSQL** (recommended for production) and **SQLite** (recommended for local development and lightweight deployments).
+
+### SQLite (Zero-Config)
+
+To use SQLite, simply use `create_sqlite_pool("path/to/db.sqlite")` in your code. No environment variables are strictly required, but you can configure the path via your application's own configuration.
 
 ### PostgreSQL
 

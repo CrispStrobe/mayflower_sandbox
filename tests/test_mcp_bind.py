@@ -6,19 +6,14 @@ from urllib.parse import urlparse
 import asyncpg
 import pytest
 
-from mayflower_sandbox.filesystem import VirtualFilesystem
+from mayflower_sandbox import create_sqlite_pool, VirtualFilesystem
 from mayflower_sandbox.integrations import add_http_mcp_server
 
 
 @pytest.mark.asyncio
-async def test_mcp_bind_creates_wrapper_and_calls_host(monkeypatch):
-    db = await asyncpg.create_pool(
-        database=os.environ.get("POSTGRES_DB", "mayflower_test"),
-        user=os.environ.get("POSTGRES_USER", "postgres"),
-        password=os.environ.get("POSTGRES_PASSWORD", "postgres"),
-        host=os.environ.get("POSTGRES_HOST", "localhost"),
-        port=int(os.environ.get("POSTGRES_PORT", "5432")),
-    )
+async def test_mcp_bind_creates_wrapper_and_calls_host(monkeypatch, tmp_path):
+    db_path = str(tmp_path / "mcp_bind.db")
+    db = await create_sqlite_pool(db_path)
 
     try:
         thread_id = "test_mcp_thread"

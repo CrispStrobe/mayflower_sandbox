@@ -10,9 +10,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sqlite3
 from typing import Any
 
-import asyncpg
+try:
+    import asyncpg
+except ImportError:
+    class _DummyAsyncpg:
+        class UndefinedTableError(Exception): pass
+        class UndefinedColumnError(Exception): pass
+    asyncpg = _DummyAsyncpg()  # type: ignore
 
 from .mcp_bindings import MCPBindingManager
 
@@ -28,7 +35,7 @@ class MCPBridgeServer:
     MCP server via the MCPBindingManager.
     """
 
-    def __init__(self, db_pool: asyncpg.Pool, thread_id: str):
+    def __init__(self, db_pool: Any, thread_id: str):
         """
         Initialize the MCP bridge server.
 
@@ -127,22 +134,34 @@ class MCPBridgeServer:
                     """,
                     self.thread_id,
                 )
-            except asyncpg.UndefinedTableError:
-                logger.warning(
-                    "Table 'sandbox_mcp_servers' does not exist. "
-                    "MCP server bindings are unavailable. Run database migrations."
-                )
-                rows = []
-            except asyncpg.UndefinedColumnError:
-                # Fall back if schemas column doesn't exist yet
-                rows = await conn.fetch(
-                    """
-                    SELECT name, url, headers, auth, NULL as schemas
-                    FROM sandbox_mcp_servers
-                    WHERE thread_id = $1
-                    """,
-                    self.thread_id,
-                )
+            except (asyncpg.UndefinedTableError, asyncpg.UndefinedColumnError, sqlite3.OperationalError) as e:
+                is_missing_table = isinstance(e, asyncpg.UndefinedTableError) or (isinstance(e, sqlite3.OperationalError) and "no such table" in str(e))
+                is_missing_col = isinstance(e, asyncpg.UndefinedColumnError) or (isinstance(e, sqlite3.OperationalError) and "no such column" in str(e))
+
+                if is_missing_col and not is_missing_table:
+                    # Fall back if schemas column doesn't exist yet
+                    try:
+                        rows = await conn.fetch(
+                            """
+                            SELECT name, url, headers, auth, NULL as schemas
+                            FROM sandbox_mcp_servers
+                            WHERE thread_id = $1
+                            """,
+                            self.thread_id,
+                        )
+                    except (asyncpg.UndefinedTableError, sqlite3.OperationalError) as e2:
+                        if isinstance(e2, asyncpg.UndefinedTableError) or (isinstance(e2, sqlite3.OperationalError) and "no such table" in str(e2)):
+                            rows = []
+                        else:
+                            raise
+                elif is_missing_table:
+                    logger.warning(
+                        "Table 'sandbox_mcp_servers' does not exist. "
+                        "MCP server bindings are unavailable. Run database migrations."
+                    )
+                    rows = []
+                else:
+                    raise
 
         servers: dict[str, dict[str, Any]] = {}
         for row in rows:

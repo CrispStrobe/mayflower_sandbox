@@ -6,8 +6,9 @@ import asyncio
 import contextlib
 import logging
 from datetime import datetime
+from typing import Any
 
-import asyncpg
+
 
 from mayflower_sandbox.manager import SandboxManager
 
@@ -19,7 +20,7 @@ class CleanupJob:
 
     def __init__(
         self,
-        db_pool: asyncpg.Pool,
+        db_pool: Any,
         interval_seconds: int = 3600,  # 1 hour default
         dry_run: bool = False,
     ):

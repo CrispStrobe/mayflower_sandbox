@@ -7,8 +7,9 @@ executor restarts by storing session state in PostgreSQL.
 
 import json
 import logging
+from typing import Any
 
-import asyncpg
+
 
 from mayflower_sandbox.manager import SandboxManager
 from mayflower_sandbox.sandbox_executor import ExecutionResult, SandboxExecutor
@@ -25,7 +26,7 @@ class SessionRecovery:
     - Recovery after long periods of inactivity
     """
 
-    def __init__(self, db_pool: asyncpg.Pool):
+    def __init__(self, db_pool: Any):
         """Initialize session recovery.
 
         Args:
@@ -138,7 +139,7 @@ class StatefulExecutor:
 
     def __init__(
         self,
-        db_pool: asyncpg.Pool,
+        db_pool: Any,
         thread_id: str,
         allow_net: bool = False,
         timeout_seconds: float = 60.0,

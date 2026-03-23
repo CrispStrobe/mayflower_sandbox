@@ -78,7 +78,7 @@ async def test_update_last_accessed(manager, clean_db, db_pool):
     # Wait a bit and update
     import asyncio
 
-    await asyncio.sleep(0.1)
+    await asyncio.sleep(1.1)
     await manager.update_last_accessed("thread_789")
 
     # Check updated

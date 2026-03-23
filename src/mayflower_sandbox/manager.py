@@ -3,8 +3,9 @@
 import json
 import logging
 from datetime import datetime, timedelta
+from typing import Any
 
-import asyncpg
+
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +30,7 @@ class SandboxManager:
 
     def __init__(
         self,
-        db_pool: asyncpg.Pool,
+        db_pool: Any,
         default_expiration_days: int = 180,
     ):
         """Initialize manager.

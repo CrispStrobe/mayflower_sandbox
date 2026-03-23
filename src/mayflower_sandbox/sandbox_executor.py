@@ -9,12 +9,19 @@ import asyncio
 import json
 import logging
 import os
+import sqlite3
 import subprocess  # nosec B404 - required for worker pool management
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import asyncpg
+try:
+    import asyncpg
+except ImportError:
+    class _DummyAsyncpg:
+        class UndefinedTableError(Exception): pass
+        class UndefinedColumnError(Exception): pass
+    asyncpg = _DummyAsyncpg()  # type: ignore
 
 from .bootstrap import write_bootstrap_files
 from .filesystem import VirtualFilesystem
@@ -62,7 +69,7 @@ class SandboxExecutor:
 
     def __init__(
         self,
-        db_pool: asyncpg.Pool,
+        db_pool: Any,
         thread_id: str,
         *,
         allow_net: bool = False,
@@ -106,7 +113,7 @@ class SandboxExecutor:
         self._helpers_loaded = False
 
     @classmethod
-    async def _ensure_mcp_bridge(cls, db_pool: asyncpg.Pool, thread_id: str) -> int | None:
+    async def _ensure_mcp_bridge(cls, db_pool: Any, thread_id: str) -> int | None:
         """
         Ensure MCP bridge is started (lazy initialization).
 
@@ -363,7 +370,9 @@ class SandboxExecutor:
                     """,
                     self.thread_id,
                 )
-            except asyncpg.UndefinedTableError:
+            except (asyncpg.UndefinedTableError, sqlite3.OperationalError) as e:
+                if isinstance(e, sqlite3.OperationalError) and "no such table" not in str(e):
+                    raise
                 logger.warning(
                     "Table 'sandbox_mcp_servers' does not exist. "
                     "MCP server bindings are unavailable. Run database migrations."
@@ -724,7 +733,7 @@ class SandboxExecutor:
         before_vfs_files = {f["file_path"] for f in await self.vfs.list_files()}
 
         files_dict = await self.vfs.get_all_files_for_pyodide()
-        stdin_payload = self._prepare_stdin(files_dict)
+        stdin_payload = self._prepare_stdin(files_dict) or b""
 
         try:
             proc = await asyncio.create_subprocess_exec(

@@ -9,8 +9,9 @@ import logging
 import mimetypes
 import re
 from pathlib import Path
+from typing import Any
 
-import asyncpg
+
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +40,7 @@ class VirtualFilesystem:
 
     MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB
 
-    def __init__(self, db_pool: asyncpg.Pool, thread_id: str):
+    def __init__(self, db_pool: Any, thread_id: str):
         """Initialize filesystem for specific thread.
 
         Args:

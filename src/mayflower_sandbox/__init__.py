@@ -2,11 +2,12 @@
 
 from typing import Any
 
+from .db import create_sqlite_pool
 from .filesystem import VirtualFilesystem
 from .manager import SandboxManager
 from .sandbox_executor import SandboxExecutor
 
-__all__ = ["SandboxManager", "VirtualFilesystem", "SandboxExecutor"]
+__all__ = ["SandboxManager", "VirtualFilesystem", "SandboxExecutor", "create_sqlite_pool"]
 
 PostgresBackend: Any | None
 MayflowerSandboxBackend: Any | None

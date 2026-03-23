@@ -4,20 +4,14 @@ from pathlib import PurePosixPath
 import asyncpg
 import pytest
 
-from mayflower_sandbox.filesystem import VirtualFilesystem
+from mayflower_sandbox import create_sqlite_pool, VirtualFilesystem, SandboxExecutor
 from mayflower_sandbox.integrations import install_skill
-from mayflower_sandbox.sandbox_executor import SandboxExecutor
 
 
 @pytest.mark.asyncio
-async def test_install_skill_and_import():
-    db = await asyncpg.create_pool(
-        database=os.environ.get("POSTGRES_DB", "mayflower_test"),
-        user=os.environ.get("POSTGRES_USER", "postgres"),
-        password=os.environ.get("POSTGRES_PASSWORD", "postgres"),
-        host=os.environ.get("POSTGRES_HOST", "localhost"),
-        port=int(os.environ.get("POSTGRES_PORT", "5432")),
-    )
+async def test_install_skill_and_import(tmp_path):
+    db_path = str(tmp_path / "skills.db")
+    db = await create_sqlite_pool(db_path)
 
     try:
         thread_id = "test_skill_thread"

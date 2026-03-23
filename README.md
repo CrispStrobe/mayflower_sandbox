@@ -8,13 +8,14 @@
 [![Security: Bandit](https://img.shields.io/badge/security-bandit-yellow.svg)](https://bandit.readthedocs.io/)
 [![SBOM: CycloneDX](https://img.shields.io/badge/SBOM-CycloneDX-blue.svg)](https://cyclonedx.org/)
 
-Production-ready Python sandbox implementing the [DeepAgents](https://github.com/mayflower/deepagents) `SandboxBackendProtocol`, with PostgreSQL-backed virtual filesystem and document processing helpers.
+Production-ready Python sandbox implementing the [DeepAgents](https://github.com/mayflower/deepagents) `SandboxBackendProtocol`, with persistent virtual filesystem and document processing helpers.
 
 ## Key Features
 
 - **Secure Python Execution** -- Pyodide WebAssembly sandbox with configurable network access
 - **Shell Execution** -- BusyBox WASM sandbox with pipe support (`echo | cat | grep`)
-- **Persistent Virtual Filesystem** -- PostgreSQL-backed storage (20MB per file)
+- **Persistent Virtual Filesystem** -- PostgreSQL or SQLite-backed storage (20MB per file)
+- **Zero-Config Mode** -- Full support for SQLite for easy local development and lightweight deployments
 - **Document Processing** -- Built-in helpers for Word, Excel, PowerPoint, and PDF
 - **Stateful Execution** -- Variables and state persist across executions and restarts
 - **Thread Isolation** -- Complete isolation between users/sessions via `thread_id`
@@ -22,7 +23,27 @@ Production-ready Python sandbox implementing the [DeepAgents](https://github.com
 - **Skills & MCP** -- Install Claude Skills and bind MCP servers as typed Python code
 - **Worker Pool** -- 70-95% faster execution by keeping Pyodide loaded in memory
 
-## Quick Start
+## Quick Start (SQLite - Zero Config)
+
+```bash
+pip install -e .
+```
+
+```python
+from mayflower_sandbox import MayflowerSandboxBackend, create_sqlite_pool
+
+# No database setup required. Tables are created automatically on first run.
+db_pool = await create_sqlite_pool("sandbox.db")
+
+backend = MayflowerSandboxBackend(
+    db_pool, thread_id="user_123",
+    allow_net=False, stateful=True,
+)
+
+result = await backend.aexecute("print('hello world')")
+```
+
+## Quick Start (PostgreSQL)
 
 ```bash
 pip install -e .
@@ -39,17 +60,23 @@ db_pool = await asyncpg.create_pool(
     user="postgres", password="postgres",
 )
 
-backend = MayflowerSandboxBackend(
-    db_pool, thread_id="user_123",
-    allow_net=False, stateful=True,
-)
+backend = MayflowerSandboxBackend(db_pool, thread_id="user_123")
+```
 
-result = await backend.aexecute("python /tmp/script.py")
-print(result.output, result.exit_code)
+## Development & Testing
 
-result = await backend.aexecute("echo hello | grep hello")
-await backend.awrite("/tmp/data.csv", "name,value\nfoo,42")
-content = await backend.aread("/tmp/data.csv")
+Mayflower Sandbox includes a comprehensive test suite that can run against either database backend.
+
+### Run tests with SQLite (Fastest)
+```bash
+export MAYFLOWER_USE_SQLITE=true
+pytest
+```
+
+### Run tests with PostgreSQL
+Ensure you have a local PostgreSQL instance running on port 5432 (or configure via env vars).
+```bash
+pytest
 ```
 
 ## Documentation

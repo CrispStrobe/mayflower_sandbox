@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import os
 import shutil
@@ -8,6 +9,23 @@ import pytest
 
 # Add src to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+# Optional: Redirect all asyncpg pools to SQLite for testing
+if os.environ.get("MAYFLOWER_USE_SQLITE") == "true":
+    try:
+        import asyncpg
+        import uuid
+        from mayflower_sandbox.db import create_sqlite_pool
+        
+        async def mocked_create_pool(*args, **kwargs):
+            # Use a unique file for each pool to avoid interference
+            # and clean it up later if possible, but for now just unique
+            db_path = f"/tmp/mayflower_pytest_{uuid.uuid4().hex}.db"
+            return await create_sqlite_pool(db_path)
+            
+        asyncpg.create_pool = mocked_create_pool
+    except ImportError:
+        pass
 
 # Check if deepagents is available
 DEEPAGENTS_AVAILABLE = importlib.util.find_spec("deepagents") is not None
@@ -63,9 +81,8 @@ requires_deno = pytest.mark.skipif(
 
 @pytest.fixture(scope="function", autouse=True)
 async def cleanup_worker_pool():
-    """Clean up worker pool and MCP bridge after each test to prevent event loop issues."""
+    """Clean up worker pool and MCP bridge after each test."""
     yield
-    # Clean up pool and bridge after test
     from mayflower_sandbox.sandbox_executor import SandboxExecutor
 
     if SandboxExecutor._pool is not None:

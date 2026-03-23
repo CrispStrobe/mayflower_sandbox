@@ -3,13 +3,13 @@
 ## Prerequisites
 
 - Python 3.10+
-- PostgreSQL 14+
 - Deno (for Pyodide execution)
+- **Database**: Either PostgreSQL 14+ or SQLite (included with Python)
 
 ## Install Deno
 
 ```bash
-curl -fsSL https://deno.land/x/install/install.sh | sh
+curl -fsSL https://deno.land/install.sh | sh
 
 # Add to PATH (add to ~/.bashrc or ~/.zshrc)
 export DENO_INSTALL="$HOME/.deno"
@@ -35,22 +35,30 @@ pip install -e ".[dev]"
 
 ## Database Setup
 
-### Create Database
+### Option 1: SQLite (Zero-Config)
+
+No database setup is required. You can simply create a SQLite pool in your code, which will automatically initialize the schema in a local file.
+
+```python
+from mayflower_sandbox import create_sqlite_pool
+db_pool = await create_sqlite_pool("sandbox.db")
+```
+
+### Option 2: PostgreSQL
+
+#### Create Database
 
 ```bash
 createdb mayflower_test
 ```
 
-### Apply Schema
+#### Apply Schema
 
 ```bash
 psql -d mayflower_test -f migrations/001_sandbox_schema.sql
 ```
 
-This creates three tables:
-- **sandbox_sessions** - Session tracking
-- **sandbox_filesystem** - File storage (20MB limit per file)
-- **sandbox_session_bytes** - Stateful execution support
+This creates the necessary tables for session tracking, file storage, and stateful execution support.
 
 ## Environment Variables
 
