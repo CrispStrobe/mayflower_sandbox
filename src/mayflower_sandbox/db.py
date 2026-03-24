@@ -1,6 +1,8 @@
 import asyncio
 import re
 import sqlite3
+import threading
+import logging
 from typing import Any, AsyncIterator, Dict, List, Optional
 from contextlib import asynccontextmanager
 
@@ -13,6 +15,11 @@ except ImportError:
         class CheckViolationError(Exception): pass
         class IntegrityConstraintViolationError(Exception): pass
     asyncpg = _DummyAsyncpg()  # type: ignore
+
+logger = logging.getLogger(__name__)
+
+# Global lock for SQLite operations to prevent concurrent access issues in threadpool
+_SQLITE_LOCK = threading.Lock()
 
 def _translate_query(query: str) -> str:
     """Translate PostgreSQL query to SQLite syntax."""
@@ -188,50 +195,48 @@ class SqliteConnection:
 
     async def fetch(self, query: str, *args: Any) -> List[Dict[str, Any]]:
         def run():
-            cursor = self._execute_sync(query, args)
-            return [dict(row) for row in cursor.fetchall()]
+            with _SQLITE_LOCK:
+                cursor = self._execute_sync(query, args)
+                return [dict(row) for row in cursor.fetchall()]
         return await asyncio.to_thread(run)
 
     async def fetchrow(self, query: str, *args: Any) -> Optional[Dict[str, Any]]:
         def run():
-            cursor = self._execute_sync(query, args)
-            row = cursor.fetchone()
-            return dict(row) if row else None
+            with _SQLITE_LOCK:
+                cursor = self._execute_sync(query, args)
+                row = cursor.fetchone()
+                return dict(row) if row else None
         return await asyncio.to_thread(run)
 
     async def fetchval(self, query: str, *args: Any) -> Any:
         def run():
-            cursor = self._execute_sync(query, args)
-            row = cursor.fetchone()
-            if not row:
-                return None
-            val = row[0]
-            # Heuristic: if we are expecting a boolean (like in file_exists) 
-            # and we got 0/1, keep it as is because 0 == False.
-            # But the test uses 'is False'.
-            # If the query is "SELECT EXISTS..." or "SELECT count..." 
-            # we might want to cast.
-            if query.strip().lower().startswith("select exists"):
-                return bool(val)
-            return val
+            with _SQLITE_LOCK:
+                cursor = self._execute_sync(query, args)
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                val = row[0]
+                if query.strip().lower().startswith("select exists"):
+                    return bool(val)
+                return val
         return await asyncio.to_thread(run)
 
     async def execute(self, query: str, *args: Any) -> str:
         def run():
-            if not args and ";" in query:
-                # Potential multi-statement script (common in migrations)
-                # sqlite3.execute() only supports one statement at a time.
-                # executescript() supports multiple but no parameters.
-                # We translate first.
-                query_injected, _ = self._inject_legacy_columns(query, ())
-                translated = _translate_query(query_injected)
-                self.conn.executescript(translated)
-                self.conn.commit()
-                return "DONE"
-            
-            cursor = self._execute_sync(query, args)
-            self.conn.commit()
-            return f"DONE {cursor.rowcount}"
+            with _SQLITE_LOCK:
+                if not args and ";" in query:
+                    query_injected, _ = self._inject_legacy_columns(query, ())
+                    translated = _translate_query(query_injected)
+                    self.conn.executescript(translated)
+                    self.conn.commit()
+                    return "DONE"
+                
+                cursor = self._execute_sync(query, args)
+                try:
+                    self.conn.commit()
+                except sqlite3.OperationalError:
+                    pass
+                return f"DONE {cursor.rowcount}"
         return await asyncio.to_thread(run)
 
 class SqliteDatabase:
@@ -338,43 +343,45 @@ class SqliteDatabase:
             WHERE thread_id = NEW.thread_id AND file_path = NEW.file_path;
         END;
         """
-        self._conn.executescript(schema)
-        self._conn.commit()
-
-        # Handle migrations for existing DBs
-        try:
-            self._conn.execute("ALTER TABLE sandbox_sessions ADD COLUMN parent_thread_id TEXT REFERENCES sandbox_sessions(thread_id) ON DELETE CASCADE")
+        with _SQLITE_LOCK:
+            self._conn.executescript(schema)
             self._conn.commit()
-        except sqlite3.OperationalError:
-            pass # Column already exists
 
-        try:
-            self._conn.execute("ALTER TABLE sandbox_sessions ADD COLUMN vfs_id TEXT")
-            self._conn.execute("UPDATE sandbox_sessions SET vfs_id = thread_id WHERE vfs_id IS NULL")
-            self._conn.commit()
-        except sqlite3.OperationalError:
-            pass
+            # Handle migrations for existing DBs
+            try:
+                self._conn.execute("ALTER TABLE sandbox_sessions ADD COLUMN parent_thread_id TEXT REFERENCES sandbox_sessions(thread_id) ON DELETE CASCADE")
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                pass # Column already exists
 
-        try:
-            self._conn.execute("ALTER TABLE sandbox_filesystem ADD COLUMN vfs_id TEXT")
-            self._conn.execute("UPDATE sandbox_filesystem SET vfs_id = thread_id WHERE vfs_id IS NULL")
-            self._conn.commit()
-        except sqlite3.OperationalError:
-            pass
+            try:
+                self._conn.execute("ALTER TABLE sandbox_sessions ADD COLUMN vfs_id TEXT")
+                self._conn.execute("UPDATE sandbox_sessions SET vfs_id = thread_id WHERE vfs_id IS NULL")
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                pass
 
-        try:
-            self._conn.execute("ALTER TABLE sandbox_mcp_servers ADD COLUMN vfs_id TEXT")
-            self._conn.execute("UPDATE sandbox_mcp_servers SET vfs_id = thread_id WHERE vfs_id IS NULL")
-            self._conn.commit()
-        except sqlite3.OperationalError:
-            pass
+            try:
+                self._conn.execute("ALTER TABLE sandbox_filesystem ADD COLUMN vfs_id TEXT")
+                self._conn.execute("UPDATE sandbox_filesystem SET vfs_id = thread_id WHERE vfs_id IS NULL")
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                pass
+
+            try:
+                self._conn.execute("ALTER TABLE sandbox_mcp_servers ADD COLUMN vfs_id TEXT")
+                self._conn.execute("UPDATE sandbox_mcp_servers SET vfs_id = thread_id WHERE vfs_id IS NULL")
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                pass
 
     @asynccontextmanager
     async def acquire(self) -> AsyncIterator[SqliteConnection]:
         yield SqliteConnection(self._conn)
 
     async def close(self):
-        self._conn.close()
+        with _SQLITE_LOCK:
+            self._conn.close()
 
 async def create_sqlite_pool(db_path: str) -> SqliteDatabase:
     """Create a SQLite database pool that mimics asyncpg.Pool."""

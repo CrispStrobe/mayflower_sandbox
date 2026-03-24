@@ -282,10 +282,10 @@ class PostgresBackend(BackendProtocol):
     # read
     # -------------------------------------------------------------------------
 
-    def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> str:
-        return self._run_async(self.aread(file_path, offset=offset, limit=limit))
+    def read(self, file_path: str, offset: int = 0, limit: int = 2000, raw: bool = False) -> str:
+        return self._run_async(self.aread(file_path, offset=offset, limit=limit, raw=raw))
 
-    async def aread(self, file_path: str, offset: int = 0, limit: int = 2000) -> str:
+    async def aread(self, file_path: str, offset: int = 0, limit: int = 2000, raw: bool = False) -> str:
         try:
             record = await self._vfs.read_file(file_path)
         except (FileNotFoundError, InvalidPathError):
@@ -293,6 +293,10 @@ class PostgresBackend(BackendProtocol):
 
         content_bytes = record.get("content", b"") or b""
         content = content_bytes.decode("utf-8", errors="replace")
+        
+        if raw:
+            return content
+
         empty_msg = _empty_content_warning(content)
         if empty_msg:
             return empty_msg

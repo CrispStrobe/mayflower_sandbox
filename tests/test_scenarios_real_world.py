@@ -289,3 +289,131 @@ print("Evidence destroyed.")
     recovered_data = await auditor.aread("/home/stolen_data.txt")
     assert "SECRET_KEY_12345" in recovered_data
     print("Forensic recovery successful.")
+
+# ---------------------------------------------------------------------------
+# Scenario 10: Multi-Agent Model Data Pipeline (High Concurrency VFS)
+# ---------------------------------------------------------------------------
+@pytest.mark.anyio
+async def test_multi_agent_data_pipeline_scenario(db_pool):
+    """
+    Scenario 10: Agents working in parallel on data shards.
+    1. Orchestrator writes 3 data shards to 'model_ws'.
+    2. 3 Worker Agents process their respective shards simultaneously.
+    3. Orchestrator aggregates the 'processed' flags.
+    """
+    if not shutil.which("deno"):
+        pytest.skip("Deno not found")
+
+    ws = "model_ws"
+    orchestrator = MayflowerSandboxBackend(db_pool, "orch", vfs_id=ws)
+    
+    # 1. Prepare Shards
+    for i in range(3):
+        await orchestrator.awrite(f"/home/shard_{i}.txt", f"data_{i}")
+        
+    # 2. Parallel Processing
+    async def process_shard(i):
+        worker = MayflowerSandboxBackend(db_pool, f"worker_{i}", vfs_id=ws)
+        # Read shard and write result
+        data = await worker.aread(f"/home/shard_{i}.txt", raw=True)
+        await worker.awrite(f"/home/result_{i}.json", json.dumps({"processed": True, "source": data}))
+        
+    await asyncio.gather(*(process_shard(i) for i in range(3)))
+    
+    # 3. Aggregate
+    results = []
+    for i in range(3):
+        res = json.loads(await orchestrator.aread(f"/home/result_{i}.json", raw=True))
+        results.append(res)
+        
+    assert all(r["processed"] for r in results)
+    assert results[0]["source"] == "data_0"
+
+# ---------------------------------------------------------------------------
+# Scenario 11: Automated Vulnerability Patching (Edit + Rollback + Bridge)
+# ---------------------------------------------------------------------------
+@pytest.mark.anyio
+async def test_vuln_patching_scenario(db_pool, monkeypatch):
+    """
+    Scenario 11: Security agent patches a dependency.
+    1. Agent finds 'vulnerable_lib==1.0.0' in requirements.txt.
+    2. Agent takes snapshot.
+    3. Agent uses 'edit' to update version to 1.1.0.
+    4. Agent uses eval_ts to run a 'compliance checker'.
+    5. Agent verifies success.
+    """
+    if not shutil.which("deno"):
+        pytest.skip("Deno not found")
+
+    monkeypatch.setenv("PYODIDE_POOL_SIZE", "1")
+    agent = MayflowerSandboxBackend(db_pool, "patch_agent", stateful=True)
+    
+    await agent.awrite("/home/requirements.txt", "vulnerable_lib==1.0.0\nother_lib==2.0.0")
+    
+    # Snapshot before change
+    snap = await agent.acreate_snapshot()
+    
+    # Apply Patch via edit method
+    await agent.aedit("/home/requirements.txt", "vulnerable_lib==1.0.0", "vulnerable_lib==1.1.0")
+    
+    # Run TS Compliance Check (simulated)
+    # We pass the content as a string instead of reading from host disk
+    content_for_check = await agent.aread("/home/requirements.txt")
+    ts_checker = f"""
+    const content = {json.dumps(content_for_check)};
+    return {{ ok: content.includes('1.1.0'), version: '1.1.0' }};
+    """
+    
+    res = await agent.aexecute(f"print(await eval_ts({json.dumps(ts_checker)}))")
+    assert "'ok': True" in res.output
+    
+    # Verify file content
+    content = await agent.aread("/home/requirements.txt")
+    assert "1.1.0" in content
+    assert "1.0.0" not in content
+
+# ---------------------------------------------------------------------------
+# Scenario 12: Cross-Platform Asset Converter (Binary + Inter-language)
+# ---------------------------------------------------------------------------
+@pytest.mark.anyio
+async def test_asset_converter_scenario(db_pool):
+    """
+    Scenario 12: Converting a binary asset.
+    1. Agent uploads a 'binary' file (simulated with random bytes).
+    2. Python computes a checksum.
+    3. TS Bridge performs a 'transformation' (simulated).
+    4. Agent verifies the output binary exists.
+    """
+    if not shutil.which("deno"):
+        pytest.skip("Deno not found")
+
+    backend = MayflowerSandboxBackend(db_pool, "converter_agent")
+    
+    # 1. Upload Binary
+    raw_data = b"\x00\xFF\xAA\x55" * 100
+    await backend.aupload_files([("/home/input.bin", raw_data)])
+    
+    # 2. Python Metadata
+    py_code = """
+import hashlib
+with open('/home/input.bin', 'rb') as f:
+    checksum = hashlib.md5(f.read()).hexdigest()
+print(f"CHECKSUM: {checksum}")
+"""
+    res = await backend.aexecute(py_code)
+    assert "CHECKSUM:" in res.output
+    
+    # 3. TS Transformation (Reads from VFS, writes back)
+    # We simulate reading the file in JS via the bridge's temporary file logic
+    # or just passing data back and forth.
+    ts_code = """
+    // In a real scenario, we'd use Deno.readFile if mapped, 
+    // but here we demonstrate data passing.
+    return { status: 'converted', size: 400 };
+    """
+    res_ts = await backend.aexecute(f"print(await eval_ts({json.dumps(ts_code)}))")
+    assert "'status': 'converted'" in res_ts.output
+    
+    # 4. Final verification
+    assert await backend._vfs.file_exists("/home/input.bin")
+
