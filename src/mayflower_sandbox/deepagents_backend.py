@@ -895,30 +895,79 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
     def _should_route_to_pyodide(self, command: str) -> bool:
         """Robustly decide if a command should be routed to Pyodide.
         
-        Uses AST parsing to check if the code is valid Python.
+        Uses AST parsing to check if the code is valid Python, but also
+        applies heuristics to avoid misrouting shell commands.
         """
         import ast
         import textwrap
+        import re
         
-        # Trim but preserve structure
         stripped = command.strip()
         if not stripped:
             return False
             
+        # Multi-line is highly likely to be Python
+        if "\n" in stripped:
+            # But not if it's a simple shell pipeline
+            if "|" in stripped or ">" in stripped:
+                # continue to further checks
+                pass
+            else:
+                return True
+            
+        # Explicit Python patterns - check these BEFORE shell symbols
+        # Use word boundaries to avoid matching substrings in shell commands
+        if re.search(r"^(import|from|def|class|async|await|lambda)\b", stripped):
+            return True
+            
+        if "eval_ts(" in stripped:
+            return True
+
+        # Common shell patterns that are likely NOT Python in a single-line context
+        # If it has a pipe | or redirect > and doesn't look like Python keywords above, it's shell.
+        if "|" in stripped or ">" in stripped or "<" in stripped:
+            # Special case: bitwise OR or comparisons in Python
+            # If it parses as a simple Expr with these, it might be Python,
+            # but usually agents use them for shell.
+            # We'll let AST decide if it's NOT a common shell command.
+            pass
+
+        # Common shell commands that might parse as valid Python expressions
+        if re.match(r"^(echo|ls|cat|cd|pwd|mkdir|rm|cp|mv|touch|grep|find|sed|awk|wc)\b", stripped):
+            return False
+
         # Try to dedent so that indented snippets are valid
         try:
             dedented = textwrap.dedent(command)
             tree = ast.parse(dedented)
             
-            # If it's just a single identifier, it's probably a shell command
+            # If it's more than one statement, it's Python
+            if len(tree.body) > 1:
+                return True
+                
             if len(tree.body) == 1:
                 node = tree.body[0]
-                if isinstance(node, ast.Expr) and isinstance(node.value, ast.Name):
-                    return False
+                # If it's an assignment (x = 1, data['x'] = 1, self.x = 1), it's Python
+                if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                    return True
+                    
+                if isinstance(node, ast.Expr):
+                    # Function calls or awaits are likely Python
+                    if isinstance(node.value, (ast.Call, ast.Await)):
+                        return True
+                    # If it's a Name (ls), it's shell
+                    if isinstance(node.value, ast.Name):
+                        return False
+                    # Everything else in single-line Expr is suspect but let's be more lenient
+                    # e.g. "1+1" should be Python
+                    # But NOT if it starts with a common shell command (checked above)
+                    return True
+                
+                # Control flow etc are definitely Python
                 return True
             return len(tree.body) > 0
         except SyntaxError:
-            # Not valid Python (even after dedent)
+            # Not valid Python
             return False
 
     def execute(self, command: str) -> ExecuteResponse:
