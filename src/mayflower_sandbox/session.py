@@ -160,6 +160,8 @@ class StatefulExecutor:
         self.db_pool = db_pool
         self.thread_id = thread_id
         self.vfs_id = vfs_id or thread_id
+        self.allow_net = allow_net
+        self.enable_debugger = enable_debugger
         self.executor = SandboxExecutor(
             db_pool, 
             thread_id, 
@@ -227,6 +229,12 @@ class StatefulExecutor:
         await self.manager.update_last_accessed(self.thread_id)
 
         return result
+
+    async def execute_shell(self, command: str) -> ExecutionResult:
+        """Execute shell command via BusyBox WASM sandbox."""
+        # Ensure session exists
+        await self.manager.get_or_create_session(self.thread_id)
+        return await self.executor.execute_shell(command)
 
     async def reset_session(self) -> None:
         """Reset the session by deleting stored state.

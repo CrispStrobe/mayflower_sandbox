@@ -14,18 +14,38 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 if os.environ.get("MAYFLOWER_USE_SQLITE") == "true":
     try:
         import asyncpg
-        import uuid
         from mayflower_sandbox.db import create_sqlite_pool
         
+        # Use a consistent file for the duration of the test session
+        # but clear it between tests (see clean_sqlite_db below)
+        _SQLITE_TEST_DB = "/tmp/mayflower_pytest_shared.db"
+        
         async def mocked_create_pool(*args, **kwargs):
-            # Use a unique file for each pool to avoid interference
-            # and clean it up later if possible, but for now just unique
-            db_path = f"/tmp/mayflower_pytest_{uuid.uuid4().hex}.db"
-            return await create_sqlite_pool(db_path)
+            return await create_sqlite_pool(_SQLITE_TEST_DB)
             
         asyncpg.create_pool = mocked_create_pool
     except ImportError:
         pass
+
+@pytest.fixture(scope="function", autouse=True)
+async def clean_sqlite_db():
+    """Clear the shared SQLite test database before each test if using redirection."""
+    if os.environ.get("MAYFLOWER_USE_SQLITE") == "true":
+        from mayflower_sandbox.db import create_sqlite_pool
+        pool = await create_sqlite_pool("/tmp/mayflower_pytest_shared.db")
+        async with pool.acquire() as conn:
+            # We must disable FKs briefly to truncate everything or delete in order
+            await conn.execute("PRAGMA foreign_keys = OFF")
+            await conn.execute("DELETE FROM sandbox_filesystem")
+            await conn.execute("DELETE FROM sandbox_session_bytes")
+            await conn.execute("DELETE FROM sandbox_sessions")
+            await conn.execute("DELETE FROM sandbox_skills")
+            await conn.execute("DELETE FROM sandbox_mcp_servers")
+            await conn.execute("DELETE FROM sandbox_package_cache")
+            await conn.execute("PRAGMA foreign_keys = ON")
+        await pool.close()
+    yield
+
 
 # Check if deepagents is available
 DEEPAGENTS_AVAILABLE = importlib.util.find_spec("deepagents") is not None

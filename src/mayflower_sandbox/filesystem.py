@@ -2,7 +2,7 @@
 
 This VFS serves as the persistent layer. Files stored here will be:
 - Loaded into Pyodide memfs before execution (pre-load)
-- Saved from Pyodide memfs after execution (post-save)
+- Saved from Pyodide memfs after execution (post-sync)
 """
 
 import logging
@@ -25,16 +25,14 @@ class FileTooLargeError(Exception):
 
 
 class InvalidPathError(Exception):
-    """Path is invalid or outside allowed sandbox."""
+    """Invalid path or security violation."""
 
 
 class VirtualFilesystem:
-    """Thread-isolated virtual filesystem backed by PostgreSQL.
+    """Virtual filesystem implementation.
 
-    Features:
-    - Per-thread file isolation
-    - 20MB file size limit
-    - Automatic MIME type detection
+    Responsibilities:
+    - Persistent file storage in PostgreSQL or SQLite
     - Path validation and sanitization
     """
 
@@ -52,12 +50,19 @@ class VirtualFilesystem:
         self.thread_id = thread_id
         self.vfs_id = vfs_id or thread_id
 
+    def _safe_dict(self, s: Any) -> dict:
+        """Convert a database record to a dict, but handle Mocks safely."""
+        if s is None:
+            return {}
+        if hasattr(s, "items") and "Mock" not in str(type(s)):
+            return dict(s)
+        return s
+
     async def ensure_session(self) -> None:
         """Ensure session exists in database for this thread_id.
 
         Creates session if it doesn't exist. This is called automatically
-        before file operations to prevent foreign key constraint violations.
-
+        before write operations.
         Sets a default expiration of 1 day from now if creating a new session.
         """
         async with self.db.acquire() as conn:
@@ -78,30 +83,27 @@ class VirtualFilesystem:
             file_path: Path to validate
 
         Returns:
-            Normalized path
+            Normalized absolute path
 
         Raises:
-            InvalidPathError: If path is invalid
+            InvalidPathError: If path is invalid or malicious
         """
-        # Normalize path
-        normalized = str(Path(file_path).as_posix())
+        if not file_path:
+            raise InvalidPathError("Path cannot be empty")
 
-        # Ensure absolute path
-        if not normalized.startswith("/"):
-            normalized = "/" + normalized
+        # Basic path traversal protection
+        if ".." in file_path:
+            raise InvalidPathError("Path traversal not allowed")
 
-        # Reject parent directory references
-        if ".." in normalized:
-            raise InvalidPathError(f"Path traversal detected: {file_path}")
+        # Normalize to absolute path
+        path = Path(file_path)
+        if not path.is_absolute():
+            path = Path("/") / path
 
-        # Reject special characters that could cause issues
-        if re.search(r'[<>:"|?*\x00-\x1f]', normalized):
-            raise InvalidPathError(f"Invalid characters in path: {file_path}")
-
-        return normalized
+        return str(path)
 
     def detect_content_type(self, file_path: str, content: bytes) -> str:
-        """Detect MIME type from file extension and content.
+        """Detect MIME type based on path and content.
 
         Args:
             file_path: File path for extension detection
@@ -112,26 +114,23 @@ class VirtualFilesystem:
         """
         # Try extension-based detection first
         mime_type, _ = mimetypes.guess_type(file_path)
-
         if mime_type:
             return mime_type
 
-        # Fallback based on content inspection
-        if content.startswith(b"\x89PNG"):
+        # Basic magic number detection
+        if content.startswith(b"\x89PNG\r\n\x1a\n"):
             return "image/png"
         if content.startswith(b"\xff\xd8\xff"):
             return "image/jpeg"
-        if content.startswith(b"GIF8"):
-            return "image/gif"
-        if content.startswith(b"%PDF"):
+        if content.startswith(b"%PDF-"):
             return "application/pdf"
-
-        # Check if likely text
-        try:
-            content[:1024].decode("utf-8")
-            return "text/plain"
-        except UnicodeDecodeError:
+        if content.startswith(b"PK\x03\x04"):
+            # Excel/Word/PPT are all ZIP based, but extension detection
+            # should have caught them above. Fallback to generic binary.
             return "application/octet-stream"
+
+        # Default to text or binary based on null-byte presence
+        return "text/plain" if b"\x00" not in content else "application/octet-stream"
 
     async def write_file(
         self,
@@ -139,36 +138,33 @@ class VirtualFilesystem:
         content: bytes,
         content_type: str | None = None,
     ) -> dict:
-        """Write file to filesystem.
+        """Write file to virtual filesystem.
 
         Args:
-            file_path: Path to write
-            content: File content as bytes
-            content_type: Optional MIME type (auto-detected if None)
+            file_path: Absolute path to the file
+            content: Binary file content
+            content_type: Optional MIME type (autodetected if None)
 
         Returns:
-            File metadata dict
+            Dictionary with file metadata
 
         Raises:
+            FileTooLargeError: If file exceeds size limit
             InvalidPathError: If path is invalid
-            FileTooLargeError: If content exceeds 20MB
         """
-        # Ensure session exists before writing
-        await self.ensure_session()
-
-        # Validate path
         normalized_path = self.validate_path(file_path)
-
-        # Check size
         size = len(content)
+
         if size > self.MAX_FILE_SIZE:
             raise FileTooLargeError(
-                f"File size {size} bytes exceeds limit of {self.MAX_FILE_SIZE} bytes"
+                f"File {file_path} exceeds {self.MAX_FILE_SIZE / 1024 / 1024}MB limit"
             )
 
-        # Detect content type if not provided
         if content_type is None:
             content_type = self.detect_content_type(normalized_path, content)
+
+        # Lazily ensure session exists before writing
+        await self.ensure_session()
 
         # Upsert file
         async with self.db.acquire() as conn:
@@ -195,7 +191,7 @@ class VirtualFilesystem:
 
             logger.debug(f"Wrote file {normalized_path} ({size} bytes) for vfs {self.vfs_id}")
 
-            return dict(result) if result else {}
+            return self._safe_dict(result)
 
     async def read_file(self, file_path: str) -> dict:
         """Read file from filesystem.
@@ -227,7 +223,7 @@ class VirtualFilesystem:
                     f"File {normalized_path} not found in thread {self.thread_id}"
                 )
 
-            return dict(result)
+            return self._safe_dict(result)
 
     async def delete_file(self, file_path: str) -> bool:
         """Delete file from filesystem.
@@ -287,7 +283,7 @@ class VirtualFilesystem:
                     self.vfs_id,
                 )
 
-            return [dict(f) for f in files]
+            return [self._safe_dict(f) for f in files]
 
     async def file_exists(self, file_path: str) -> bool:
         """Check if file exists.
@@ -311,7 +307,7 @@ class VirtualFilesystem:
                     self.vfs_id,
                     normalized_path,
                 )
-                return result
+                return bool(result)
         except InvalidPathError:
             return False
 

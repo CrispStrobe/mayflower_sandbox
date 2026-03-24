@@ -30,7 +30,8 @@ interface ExecutionResult {
   result: unknown;
   sessionBytes?: number[];
   sessionMetadata?: Record<string, unknown>;
-  files?: Array<{ path: string; content: number[] }>;
+  created_files?: Array<{ path: string; content: number[] }>; // for compatibility
+  files?: Record<string, number[]>; // changed to record for host-side easy lookup
 }
 
 // Utility functions (filterMicropipMessages, createStdoutHandler, etc.)
@@ -260,7 +261,19 @@ except ImportError:
 
     // Collect changed files
     const allChangedPaths = new Set([...tracker.createdFiles, ...tracker.modifiedFiles]);
-    result.files = collectFilesFromPaths(pyodide, Array.from(allChangedPaths));
+    result.created_files = collectFilesFromPaths(pyodide, Array.from(allChangedPaths));
+
+    // Return full file list for deletion detection
+    if (options.stateful) {
+      const { snapshotFiles } = await import("./fs_utils.ts");
+      const finalSnapshot = snapshotFiles(pyodide, ["/tmp", "/home"]);
+      const finalFilesRecord: Record<string, number[]> = {};
+      const collected = collectFilesFromPaths(pyodide, Array.from(finalSnapshot.keys()));
+      for (const fileObj of collected) {
+        finalFilesRecord[fileObj.path] = fileObj.content;
+      }
+      result.files = finalFilesRecord;
+    }
 
     return result;
   } catch (e) {

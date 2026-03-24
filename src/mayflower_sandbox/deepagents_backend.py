@@ -175,16 +175,18 @@ class PostgresBackend(BackendProtocol):
         ```
     """
 
-    def __init__(self, db_pool: Any, thread_id: str) -> None:
+    def __init__(self, db_pool: Any, thread_id: str, vfs_id: str | None = None) -> None:
         """Initialize PostgresBackend.
 
         Args:
             db_pool: asyncpg connection pool for PostgreSQL.
             thread_id: Thread/session identifier for file isolation.
+            vfs_id: Optional shared VFS identifier. Defaults to thread_id.
         """
-        self._thread_id = thread_id
-        self._vfs = VirtualFilesystem(db_pool, thread_id)
         self._db_pool = db_pool
+        self._thread_id = thread_id
+        self._vfs_id = vfs_id or thread_id
+        self._vfs = VirtualFilesystem(db_pool, thread_id, vfs_id=self._vfs_id)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread_id: int | None = None
         try:
@@ -597,19 +599,31 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
             enable_debugger: Whether to enable Deno debugger (inspector).
             timeout_seconds: Execution timeout in seconds.
         """
-        super().__init__(db_pool, thread_id)
+        # Pass vfs_id to parent (PostgresBackend)
+        super().__init__(db_pool, thread_id, vfs_id=vfs_id)
         self._vfs_id = vfs_id or thread_id
-        # Override the base _vfs which might have been initialized without vfs_id
-        self._vfs = VirtualFilesystem(db_pool, thread_id, vfs_id=self._vfs_id)
-        self._executor = SandboxExecutor(
-            db_pool,
-            thread_id,
-            vfs_id=self._vfs_id,
-            allow_net=allow_net,
-            stateful=stateful,
-            enable_debugger=enable_debugger,
-            timeout_seconds=timeout_seconds,
-        )
+        self._stateful = stateful
+        
+        if stateful:
+            from .session import StatefulExecutor
+            self._executor = StatefulExecutor(
+                db_pool,
+                thread_id,
+                vfs_id=self._vfs_id,
+                allow_net=allow_net,
+                enable_debugger=enable_debugger,
+                timeout_seconds=timeout_seconds,
+            )
+        else:
+            self._executor = SandboxExecutor(
+                db_pool,
+                thread_id,
+                vfs_id=self._vfs_id,
+                allow_net=allow_net,
+                stateful=False,
+                enable_debugger=enable_debugger,
+                timeout_seconds=timeout_seconds,
+            )
         self._timeout_seconds = timeout_seconds
 
     def _run_async(self, coro: Any) -> Any:
@@ -650,8 +664,8 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
             New snapshot thread_id
         """
         from mayflower_sandbox.manager import SandboxManager
-        manager = SandboxManager(self.db_pool)
-        return await manager.create_snapshot(self.thread_id, ttl_days)
+        manager = SandboxManager(self._db_pool)
+        return await manager.create_snapshot(self._thread_id, ttl_days)
         
     def create_snapshot(self, ttl_days: int = 1) -> str:
         """Create a point-in-time snapshot of the current session."""
@@ -664,8 +678,46 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
             snapshot_id: The snapshot thread_id to restore from
         """
         from mayflower_sandbox.manager import SandboxManager
-        manager = SandboxManager(self.db_pool)
-        await manager.restore_snapshot(snapshot_id, target_thread_id=self.thread_id)
+        manager = SandboxManager(self._db_pool)
+        await manager.restore_snapshot(snapshot_id, target_thread_id=self._thread_id)
+        
+        # Reload the session record to get potentially updated vfs_id
+        async with self._db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT vfs_id FROM sandbox_sessions WHERE thread_id = $1", self._thread_id)
+            if row:
+                self._vfs_id = row["vfs_id"] or self._thread_id
+                
+            # Direct DB check for our test file
+            fs_row = await conn.fetchrow(
+                "SELECT 1 FROM sandbox_filesystem WHERE vfs_id = $1 AND file_path = '/data.csv'",
+                self._vfs_id
+            )
+            logger.debug(f"DIRECT DB CHECK after restore for vfs_id={self._vfs_id}: found={fs_row is not None}")
+        
+        # Re-initialize VFS with the (potentially new) vfs_id
+        self._vfs = VirtualFilesystem(self._db_pool, self._thread_id, vfs_id=self._vfs_id)
+        
+        # Re-initialize executor to clear any stale state
+        if self._stateful:
+            from .session import StatefulExecutor
+            self._executor = StatefulExecutor(
+                self._db_pool,
+                self._thread_id,
+                vfs_id=self._vfs_id,
+                allow_net=self._executor.allow_net,
+                enable_debugger=self._executor.enable_debugger,
+                timeout_seconds=self._timeout_seconds,
+            )
+        else:
+            self._executor = SandboxExecutor(
+                self._db_pool,
+                self._thread_id,
+                vfs_id=self._vfs_id,
+                allow_net=self._executor.allow_net,
+                stateful=False,
+                enable_debugger=self._executor.enable_debugger,
+                timeout_seconds=self._timeout_seconds,
+            )
         
     def restore_snapshot(self, snapshot_id: str) -> None:
         """Restore the current session from a snapshot."""
@@ -833,6 +885,34 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
             exit_code = 0 if result.success else 1
         return ExecuteResponse(output=output, exit_code=exit_code, truncated=False)
 
+    def _should_route_to_pyodide(self, command: str) -> bool:
+        """Heuristic to decide if a command should be routed to Pyodide."""
+        stripped = command.strip()
+        if not stripped:
+            return False
+            
+        # Multi-line is almost always Python
+        if "\n" in stripped:
+            # But not if it's a shell script style (though rare for agents to send raw multi-line shell without #!)
+            return True
+            
+        # Common Python keywords at start
+        if stripped.startswith(("import ", "from ", "def ", "class ", "@", "await ")):
+            return True
+            
+        # Common Python expressions
+        if (stripped.startswith("print(") and stripped.endswith(")")):
+            return True
+            
+        # Assignments (e.g. x = 10)
+        if re.match(r"^[a-zA-Z_]\w*\s*=[^=]", stripped):
+            # Exclude shell var assignments like VAR=val (usually no space before =)
+            # and common shell commands
+            if not re.match(r"^[A-Z_]+=[^\s]+$", stripped):
+                return True
+                
+        return False
+
     def execute(self, command: str) -> ExecuteResponse:
         """Execute a command in the sandbox.
 
@@ -840,6 +920,7 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
         - ``__PYTHON__\\n<code>`` sentinel → Pyodide (direct code execution)
         - ``python -c "..."`` inline → Pyodide
         - ``python script.py`` or ``python3 script.py`` → Pyodide (file-based)
+        - Suspected Python snippets → Pyodide
         - Other commands → BusyBox shell
 
         Args:
@@ -880,6 +961,11 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
                 code = argv_setup + code
             return self._execute_python_code(code)
 
+        # Suspected Python snippet
+        if self._should_route_to_pyodide(command):
+            logger.info("Routing suspected Python snippet to Pyodide (%d chars)", len(command))
+            return self._execute_python_code(command)
+
         return self._execute_shell(command)
 
     async def aexecute(self, command: str) -> ExecuteResponse:
@@ -896,18 +982,6 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
         if inline_code:
             logger.info("Routing python -c to Pyodide (%d chars)", len(inline_code))
             return await self._aexecute_python_code(inline_code)
-
-        # NEW: Heuristic for multi-line Python snippets (often sent by agents without 'python -c')
-        if (
-            "\n" in command.strip() 
-            or command.strip().startswith("import ") 
-            or command.strip().startswith("from ")
-            or "await " in command
-        ):
-            # Check if it might be a shell pipeline before deciding
-            if not ("|" in command and not ("'" in command or '"' in command)):
-                logger.info("Routing suspected Python snippet to Pyodide (%d chars)", len(command))
-                return await self._aexecute_python_code(command)
 
         # Handle python script.py (file-based execution)
         python_cmd = self._parse_python_command(command)
@@ -928,11 +1002,20 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
                 code = argv_setup + code
             return await self._aexecute_python_code(code)
 
+        # Suspected Python snippet
+        if self._should_route_to_pyodide(command):
+            logger.info("Routing suspected Python snippet to Pyodide (%d chars)", len(command))
+            return await self._aexecute_python_code(command)
+
         result = await self._executor.execute_shell(command)
         output = result.stdout or ""
         if result.stderr:
             output = f"{output}\n{result.stderr}" if output else result.stderr
-        exit_code: int | None = result.exit_code
-        if exit_code is None:
+        
+        exit_code: int = 0
+        if result.exit_code is not None:
+            exit_code = result.exit_code
+        else:
             exit_code = 0 if result.success else 1
+            
         return ExecuteResponse(output=output, exit_code=exit_code, truncated=False)

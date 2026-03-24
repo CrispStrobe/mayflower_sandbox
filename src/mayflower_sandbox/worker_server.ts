@@ -46,6 +46,7 @@ interface ExecuteResult {
   session_bytes?: number[];
   session_metadata?: Record<string, unknown>;
   created_files?: Array<{ path: string; content: number[] }>;
+  files?: Record<string, number[]>;
   execution_time_ms: number;
 }
 
@@ -108,6 +109,9 @@ for k, v in _globals_snapshot.items():
     if isinstance(v, type) and v.__module__ == 'builtins':
         continue
     if hasattr(v, 'read') or hasattr(v, 'write'):
+        continue
+    # Filter out JsProxy objects which break cloudpickle
+    if v.__class__.__name__ == 'JsProxy':
         continue
     _session_dict[k] = v
 list(cloudpickle.dumps(_session_dict))
@@ -214,16 +218,16 @@ function collectChangedFiles(
   pyodide: any,
   tracker: ReturnType<typeof createFileTracker>,
   beforeSnapshot: Map<string, number>,
-): Array<{ path: string; content: number[] }> | undefined {
+): Array<{ path: string; content: number[] }> {
   const allChangedPaths = new Set([...tracker.createdFiles, ...tracker.modifiedFiles]);
   const afterSnapshot = snapshotFiles(pyodide, ["/"]);
   const snapshotChanges = findChangedFiles(beforeSnapshot, afterSnapshot);
   snapshotChanges.forEach((p) => allChangedPaths.add(p));
 
-  if (allChangedPaths.size === 0) return undefined;
+  if (allChangedPaths.size === 0) return [];
 
   const changedFiles = collectFilesFromPaths(pyodide, Array.from(allChangedPaths));
-  return changedFiles.length > 0 ? changedFiles : undefined;
+  return changedFiles;
 }
 
 /**
@@ -308,6 +312,17 @@ if 'matplotlib' not in sys.modules:
 
       // Collect changed files
       result.created_files = collectChangedFiles(this.pyodide, tracker, beforeSnapshot);
+
+      // Return full file list for deletion detection
+      if (params.stateful) {
+        const finalSnapshot = snapshotFiles(this.pyodide, ["/tmp", "/home"]);
+        const finalFilesRecord: Record<string, number[]> = {};
+        const collected = collectFilesFromPaths(this.pyodide, Array.from(finalSnapshot.keys()));
+        for (const fileObj of collected) {
+          finalFilesRecord[fileObj.path] = fileObj.content;
+        }
+        result.files = finalFilesRecord;
+      }
 
       return result;
     } catch (e: unknown) {

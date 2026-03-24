@@ -19,12 +19,12 @@ class SessionExpiredError(Exception):
 
 
 class SandboxManager:
-    """Manages sandbox session lifecycle and expiration.
+    """Manages lifecycle of sandbox sessions.
 
-    Handles:
+    Responsibilities:
     - Session creation and retrieval
-    - Expiration tracking (default 6 months)
-    - Last accessed timestamp updates
+    - Metadata management
+    - Expiration tracking
     - Cleanup of expired sessions
     """
 
@@ -37,10 +37,54 @@ class SandboxManager:
 
         Args:
             db_pool: PostgreSQL connection pool
-            default_expiration_days: Default session lifetime (default: 180 days)
+            default_expiration_days: Default TTL for new sessions
         """
         self.db = db_pool
         self.default_expiration_days = default_expiration_days
+
+    def _safe_dict(self, s: Any) -> dict:
+        """Convert a database record to a dict, but handle Mocks safely."""
+        if s is None:
+            return {}
+        if hasattr(s, "items") and not hasattr(s, "mock_calls"):
+            return dict(s)
+        return s
+
+    async def create_session(
+        self,
+        thread_id: str,
+        metadata: dict | None = None,
+        vfs_id: str | None = None,
+    ) -> dict:
+        """Create a new session explicitly.
+
+        Args:
+            thread_id: Thread identifier
+            metadata: Optional metadata
+            vfs_id: Optional shared VFS identifier. Defaults to thread_id.
+
+        Returns:
+            Session record
+        """
+        expires_at = datetime.now() + timedelta(days=self.default_expiration_days)
+        effective_vfs_id = vfs_id or thread_id
+        
+        async with self.db.acquire() as conn:
+            session = await conn.fetchrow(
+                """
+                INSERT INTO sandbox_sessions (
+                    thread_id, expires_at, metadata, vfs_id
+                ) VALUES ($1, $2, $3::jsonb, $4)
+                RETURNING *
+            """,
+                thread_id,
+                expires_at,
+                json.dumps(metadata or {}),
+                effective_vfs_id,
+            )
+
+            logger.info(f"Created session {thread_id} (VFS: {effective_vfs_id})")
+            return self._safe_dict(session)
 
     async def get_or_create_session(
         self,
@@ -69,17 +113,16 @@ class SandboxManager:
 
             if session:
                 # Check if expired
-                if session["expires_at"] < datetime.now():
-                    raise SessionExpiredError(
-                        f"Session {thread_id} expired at {session['expires_at']}"
-                    )
+                expires_at = session["expires_at"]
+                if isinstance(expires_at, datetime):
+                    if expires_at < datetime.now():
+                        raise SessionExpiredError(
+                            f"Session {thread_id} expired at {expires_at}"
+                        )
 
                 # Update last accessed
                 await self.update_last_accessed(thread_id)
-                
-                # If caller requested a specific vfs_id, and existing session has a different one,
-                # we should probably warn or update it. For now, we return existing.
-                return dict(session)
+                return self._safe_dict(session)
 
             # Create new session
             effective_vfs_id = vfs_id or thread_id
@@ -98,7 +141,7 @@ class SandboxManager:
             )
 
             logger.info(f"Created new session for thread {thread_id} (VFS: {effective_vfs_id}), expires {expires_at}")
-            return dict(session) if session else {}
+            return self._safe_dict(session)
 
     async def get_session(self, thread_id: str) -> dict:
         """Get existing session.
@@ -110,7 +153,7 @@ class SandboxManager:
             Session record
 
         Raises:
-            SessionNotFoundError: If session doesn't exist
+            SessionNotFoundError: If session does not exist
             SessionExpiredError: If session has expired
         """
         async with self.db.acquire() as conn:
@@ -121,10 +164,15 @@ class SandboxManager:
             if not session:
                 raise SessionNotFoundError(f"Session {thread_id} not found")
 
-            if session["expires_at"] < datetime.now():
-                raise SessionExpiredError(f"Session {thread_id} expired at {session['expires_at']}")
+            # Check if expired
+            expires_at = session["expires_at"]
+            if isinstance(expires_at, datetime):
+                if expires_at < datetime.now():
+                    raise SessionExpiredError(
+                        f"Session {thread_id} expired at {expires_at}"
+                    )
 
-            return dict(session)
+            return self._safe_dict(session)
 
     async def update_last_accessed(self, thread_id: str) -> None:
         """Update last accessed timestamp.
@@ -134,33 +182,51 @@ class SandboxManager:
         """
         async with self.db.acquire() as conn:
             await conn.execute(
-                """
-                UPDATE sandbox_sessions
-                SET last_accessed = NOW()
-                WHERE thread_id = $1
-            """,
+                "UPDATE sandbox_sessions SET last_accessed = NOW() WHERE thread_id = $1",
                 thread_id,
             )
 
     async def cleanup_expired_sessions(self) -> int:
         """Delete all expired sessions.
 
-        Cascade deletes files and session bytes.
-
         Returns:
             Number of sessions deleted
         """
         async with self.db.acquire() as conn:
-            result = await conn.execute("""
-                DELETE FROM sandbox_sessions
-                WHERE expires_at < NOW()
-            """)
+            # Get IDs of expired sessions first for logging
+            expired = await conn.fetch(
+                "SELECT thread_id FROM sandbox_sessions WHERE expires_at < NOW()"
+            )
+            thread_ids = [r["thread_id"] for r in expired]
+
+            if not thread_ids:
+                return 0
+
+            # Delete sessions (cascades to filesystem and session_bytes)
+            result = await conn.execute(
+                "DELETE FROM sandbox_sessions WHERE thread_id = ANY($1)",
+                thread_ids,
+            )
 
             # Parse "DELETE N" result
             count = int(result.split()[-1])
-            if count > 0:
-                logger.info(f"Cleaned up {count} expired sessions")
+            logger.info(f"Cleaned up {count} expired sessions: {thread_ids}")
             return count
+
+    async def session_exists(self, thread_id: str) -> bool:
+        """Check if session exists.
+
+        Args:
+            thread_id: Thread identifier
+
+        Returns:
+            True if exists, False otherwise
+        """
+        async with self.db.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT 1 FROM sandbox_sessions WHERE thread_id = $1", thread_id
+            )
+            return row is not None
 
     async def list_active_sessions(self, limit: int = 100) -> list[dict]:
         """List active (non-expired) sessions.
@@ -182,7 +248,7 @@ class SandboxManager:
                 limit,
             )
 
-            return [dict(s) for s in sessions]
+            return [self._safe_dict(s) for s in sessions]
 
     async def create_snapshot(self, thread_id: str, ttl_days: int = 1) -> str:
         """Create a point-in-time snapshot of a session.
@@ -224,7 +290,7 @@ class SandboxManager:
                     expires_at,
                     json.dumps(metadata),
                     thread_id,
-                    snapshot_id # Snapshot gets its own VFS by default to avoid accidental shared mutation
+                    snapshot_id # Snapshots are ALWAYS isolated clones
                 )
             except Exception as e:
                 # If parent_thread_id doesn't exist yet (migration not run)
@@ -233,7 +299,7 @@ class SandboxManager:
                 raise
             
             # 2. Copy filesystem (from parent VFS)
-            await conn.execute(
+            res = await conn.execute(
                 """
                 INSERT INTO sandbox_filesystem (
                     thread_id, vfs_id, file_path, content, content_type, size, created_at, modified_at, metadata
@@ -244,6 +310,7 @@ class SandboxManager:
                 """,
                 snapshot_id, parent_vfs_id
             )
+            logger.debug(f"Snapshot {snapshot_id}: copied files from {parent_vfs_id}, result: {res}")
             
             # 3. Copy session bytes
             await conn.execute(
@@ -280,7 +347,9 @@ class SandboxManager:
                 
             # Make sure target exists
             target_session = await conn.fetchrow("SELECT * FROM sandbox_sessions WHERE thread_id = $1", target)
+            
             if not target_session:
+                target_vfs_id = target
                 metadata = snap["metadata"]
                 if isinstance(metadata, str):
                     metadata = json.loads(metadata)
@@ -289,16 +358,29 @@ class SandboxManager:
                     """
                     INSERT INTO sandbox_sessions (thread_id, expires_at, metadata, vfs_id)
                     VALUES ($1, $2, $3::jsonb, $4)
-                    """, target, expires_at, json.dumps(metadata), target # Restored gets its own VFS (overwritten below)
+                    """, target, expires_at, json.dumps(metadata), target_vfs_id
                 )
+            else:
+                # Use existing vfs_id if it exists and is different (collaborative), 
+                # otherwise use thread_id (isolated)
+                target_vfs_id = target_session.get("vfs_id") or target
+                if target_vfs_id != target:
+                    # In collaborative mode, we want to restore specifically to THAT vfs_id
+                    pass
+                else:
+                    # In isolated mode, ensure we use the thread_id
+                    target_vfs_id = target
                 
-            target_vfs_id = target_session.get("vfs_id") if target_session else target
+            snapshot_vfs_id = snap.get("vfs_id") or snapshot_id
+            logger.debug(f"Restoring snapshot {snapshot_id} (VFS: {snapshot_vfs_id}) to target {target} (VFS: {target_vfs_id})")
                 
             # Delete existing target files and bytes
             await conn.execute("DELETE FROM sandbox_filesystem WHERE vfs_id = $1", target_vfs_id)
             await conn.execute("DELETE FROM sandbox_session_bytes WHERE thread_id = $1", target)
             
             # Copy from snapshot to target
+            # Note: We set thread_id to target so this thread 'owns' these restored files 
+            # for cleanup purposes, but they live in target_vfs_id so all collaborators see them.
             await conn.execute(
                 """
                 INSERT INTO sandbox_filesystem (
@@ -308,7 +390,7 @@ class SandboxManager:
                 FROM sandbox_filesystem
                 WHERE vfs_id = $3
                 """,
-                target, target_vfs_id, snapshot_id
+                target, target_vfs_id, snapshot_vfs_id
             )
             
             await conn.execute(

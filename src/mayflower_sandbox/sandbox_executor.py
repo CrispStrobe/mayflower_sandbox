@@ -119,7 +119,7 @@ class SandboxExecutor:
         self._helpers_loaded = False
 
     @classmethod
-    async def _ensure_mcp_bridge(cls, db_pool: Any, thread_id: str) -> int | None:
+    async def _ensure_mcp_bridge(cls, db_pool: Any, thread_id: str, stateful: bool = False) -> int | None:
         """
         Ensure MCP bridge is started (lazy initialization).
 
@@ -133,18 +133,18 @@ class SandboxExecutor:
                     bridge = MCPBridgeServer(db_pool, thread_id)
                     port = await bridge.start()
 
-                    # Only keep it if there are MCP servers configured
-                    if bridge._servers_cache:
+                    # Keep it if there are MCP servers configured OR if we are stateful (need caching/eval_ts)
+                    if bridge._servers_cache or stateful:
                         cls._mcp_bridge = bridge
                         logger.info(
                             f"MCP bridge started on port {port} "
-                            f"with servers: {list(bridge._servers_cache.keys())}"
+                            f"(stateful={stateful}, servers={list(bridge._servers_cache.keys())})"
                         )
                         return port
                     else:
-                        # No servers configured, shut it down
+                        # No servers configured and not stateful, shut it down
                         await bridge.shutdown()
-                        logger.debug("No MCP servers configured, bridge not started")
+                        logger.debug("No MCP servers and not stateful, bridge not started")
                         return None
 
         return cls._mcp_bridge.port if cls._mcp_bridge else None
@@ -158,6 +158,10 @@ class SandboxExecutor:
                     from .worker_pool import WorkerPool
 
                     pool_size = int(os.getenv("PYODIDE_POOL_SIZE", "3"))
+                    if enable_debugger:
+                        # Debugger requires predictable worker mapping
+                        pool_size = 1
+                    
                     logger.info(f"Initializing Pyodide worker pool (size={pool_size}, debugger={enable_debugger})...")
 
                     pool = WorkerPool(
@@ -568,16 +572,20 @@ class SandboxExecutor:
             "    import js\n"
             "    from pyodide.ffi import to_js\n"
             f"    url = 'http://127.0.0.1:{port}/eval_ts'\n"
+            "    # JSON dump the code twice: once for the payload, once for the JS string literal\n"
+            "    payload_data = json.dumps({'code': code})\n"
             "    options = to_js({\n"
             "        'method': 'POST',\n"
-            "        'body': json.dumps({'code': code}),\n"
+            "        'body': payload_data,\n"
             "        'headers': {'Content-Type': 'application/json'}\n"
             "    }, dict_converter=js.Object.fromEntries)\n"
             "    resp = await js.fetch(url, options)\n"
-            "    resp_text = await resp.text()\n"
-            "    return json.loads(resp_text)\n"
+            "    text = await resp.text()\n"
+            "    # Explicitly convert to string to break JS proxy reference\n"
+            "    return json.loads(str(text))\n"
             "\n"
-            "builtins.eval_ts = eval_ts\n"
+            "if not hasattr(builtins, 'eval_ts'):\n"
+            "    builtins.eval_ts = eval_ts\n"
             "\n"
             "def __MAYFLOWER_MONKEYPATCH_MICROPIP__():\n"
             "    try:\n"
@@ -707,7 +715,7 @@ class SandboxExecutor:
                 )
 
             # Start MCP bridge if needed (before pool, so port is available)
-            bridge_port = await self._ensure_mcp_bridge(self.db_pool, self.thread_id)
+            bridge_port = await self._ensure_mcp_bridge(self.db_pool, self.thread_id, stateful=self.stateful)
 
             # Ensure pool is started with MCP bridge port
             await self._ensure_pool(mcp_bridge_port=bridge_port, enable_debugger=self.enable_debugger)
@@ -727,9 +735,9 @@ class SandboxExecutor:
 
             # Add MCP bridge prelude if bridge is running
             if bridge_port:
+                # Features like eval_ts and micropip caching depend on the bridge
                 servers = await self._get_mcp_server_configs()
-                if servers:
-                    prelude_parts.append(self._build_mcp_prelude(servers, bridge_port))
+                prelude_parts.append(self._build_mcp_prelude(servers or {}, bridge_port))
 
             combined_prelude = "\n".join(prelude_parts)
             code_to_run = combined_prelude + ("\n" if not code.startswith("\n") else "") + code
@@ -753,6 +761,28 @@ class SandboxExecutor:
             created_files = await self._detect_vfs_fallback_files(
                 before_vfs_files, result, created_files
             )
+
+            # NEW: Handle deletions (Feature 3 improvement)
+            if result.get("success"):
+                # Normalize final worker file paths from the full list returned by worker
+                final_worker_files = set()
+                worker_files_data = result.get("files")
+                if isinstance(worker_files_data, dict):
+                    for f in worker_files_data.keys():
+                        final_worker_files.add(f if f.startswith("/") else f"/{f}")
+                
+                # Only perform deletion if we actually got a final file list to compare against
+                if final_worker_files:
+                    for old_file in before_vfs_files:
+                        # CRITICAL: Only delete if the file is in /tmp or /home
+                        # Other files (like root project files) are not tracked by worker
+                        is_tracked_path = old_file.startswith("/tmp") or old_file.startswith("/home")
+                        
+                        if is_tracked_path and old_file not in final_worker_files:
+                            # Also check if it's a hidden/system file we don't want to delete
+                            if not old_file.startswith("/home/pyodide") and not old_file == "/sitecustomize.py":
+                                logger.info(f"Deleting {old_file} from VFS (deleted during execution)")
+                                await self.vfs.delete_file(old_file)
 
             execution_time = time.time() - start_time
             logger.info(
@@ -879,6 +909,22 @@ class SandboxExecutor:
         created_files = await self._detect_vfs_fallback_files(
             before_vfs_files, result, created_files
         )
+
+        # NEW: Handle deletions (Feature 3 improvement)
+        if result.get("success"):
+            final_worker_files = set()
+            worker_files_data = result.get("files")
+            if isinstance(worker_files_data, dict):
+                for f in worker_files_data.keys():
+                    final_worker_files.add(f if f.startswith("/") else f"/{f}")
+            
+            if final_worker_files:
+                for old_file in before_vfs_files:
+                    is_tracked_path = old_file.startswith("/tmp") or old_file.startswith("/home")
+                    if is_tracked_path and old_file not in final_worker_files:
+                        if not old_file.startswith("/home/pyodide") and not old_file == "/sitecustomize.py":
+                            logger.info(f"Deleting {old_file} from VFS (deleted during shell execution)")
+                            await self.vfs.delete_file(old_file)
 
         success = bool(result.get("success", False))
         exit_code = result.get("exit_code")

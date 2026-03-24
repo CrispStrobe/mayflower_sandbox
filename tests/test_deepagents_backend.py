@@ -175,6 +175,7 @@ class TestMayflowerSandboxBackend:
         with (
             patch.object(module, "VirtualFilesystem", return_value=mock_vfs),
             patch.object(module, "SandboxExecutor", return_value=mock_executor),
+            patch("mayflower_sandbox.session.StatefulExecutor", return_value=mock_executor),
         ):
             return module.MayflowerSandboxBackend(mock_db_pool, "test_thread")
 
@@ -577,6 +578,7 @@ class TestExecutePythonSentinel:
         with (
             patch.object(module, "VirtualFilesystem", return_value=mock_vfs),
             patch.object(module, "SandboxExecutor", return_value=mock_executor),
+            patch("mayflower_sandbox.session.StatefulExecutor", return_value=mock_executor),
         ):
             backend = module.MayflowerSandboxBackend(mock_db_pool, "test")
             backend._executor = mock_executor
@@ -628,6 +630,7 @@ class TestExecutePythonScript:
         with (
             patch.object(module, "VirtualFilesystem", return_value=mock_vfs),
             patch.object(module, "SandboxExecutor", return_value=mock_executor),
+            patch("mayflower_sandbox.session.StatefulExecutor", return_value=mock_executor),
         ):
             backend = module.MayflowerSandboxBackend(mock_db_pool, "test")
             backend._vfs = mock_vfs
@@ -702,6 +705,7 @@ class TestErrorPaths:
         with (
             patch.object(module, "VirtualFilesystem", return_value=mock_vfs),
             patch.object(module, "SandboxExecutor", return_value=mock_executor),
+            patch("mayflower_sandbox.session.StatefulExecutor", return_value=mock_executor),
         ):
             return module.MayflowerSandboxBackend(mock_db_pool, "test_thread")
 
@@ -902,6 +906,7 @@ class TestSyncWrappers:
         with (
             patch.object(module, "VirtualFilesystem", return_value=mock_vfs),
             patch.object(module, "SandboxExecutor", return_value=mock_executor),
+            patch("mayflower_sandbox.session.StatefulExecutor", return_value=mock_executor),
         ):
             return module.MayflowerSandboxBackend(mock_db_pool, "test_thread")
 
