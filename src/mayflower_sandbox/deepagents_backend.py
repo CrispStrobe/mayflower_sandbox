@@ -885,63 +885,55 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
             exit_code = 0 if result.success else 1
         return ExecuteResponse(output=output, exit_code=exit_code, truncated=False)
 
+    _PYTHON_SENTINEL = "__PYTHON__"
+    _SHELL_SENTINEL = "__SHELL__"
+
     def _should_route_to_pyodide(self, command: str) -> bool:
-        """Heuristic to decide if a command should be routed to Pyodide."""
+        """Robustly decide if a command should be routed to Pyodide.
+        
+        Uses AST parsing to check if the code is valid Python.
+        """
+        import ast
+        import textwrap
+        
+        # Trim but preserve structure
         stripped = command.strip()
         if not stripped:
             return False
             
-        # Multi-line is almost always Python
-        if "\n" in stripped:
-            # But not if it's a shell script style (though rare for agents to send raw multi-line shell without #!)
-            return True
+        # Try to dedent so that indented snippets are valid
+        try:
+            dedented = textwrap.dedent(command)
+            tree = ast.parse(dedented)
             
-        # Common Python keywords at start
-        if stripped.startswith(("import ", "from ", "def ", "class ", "@", "await ", "if ", "for ", "while ", "try ", "with ", "async ")):
-            return True
-            
-        # Common Python expressions
-        if (stripped.startswith("print(") and stripped.endswith(")")):
-            return True
-            
-        # Assignments (e.g. x = 10, data['x'] = 10, self.x = 10)
-        # We look for a valid target-like prefix followed by =
-        if "=" in stripped and not stripped.startswith("="):
-            # Split by first =
-            target, _ = stripped.split("=", 1)
-            target = target.strip()
-            # If target contains spaces (and isn't a simple shell var), or contains [], or ., it's likely Python
-            if "[" in target or "." in target or " " in target:
-                # Check it's not a shell comparison like [ $x = $y ]
-                if not (target.startswith("[") and stripped.endswith("]")):
-                    return True
-            # Simple identifier assignment x=10
-            if re.match(r"^[a-z_][a-z0-9_]*$", target, re.IGNORECASE):
-                # Exclude shell-style UPPER_VAR=val (usually no space)
-                if not re.match(r"^[A-Z_]+$", target):
-                    return True
-                if " =" in stripped or "= " in stripped:
-                    return True
-                
-        return False
+            # If it's just a single identifier, it's probably a shell command
+            if len(tree.body) == 1:
+                node = tree.body[0]
+                if isinstance(node, ast.Expr) and isinstance(node.value, ast.Name):
+                    return False
+                return True
+            return len(tree.body) > 0
+        except SyntaxError:
+            # Not valid Python (even after dedent)
+            return False
 
     def execute(self, command: str) -> ExecuteResponse:
         """Execute a command in the sandbox.
 
-        Automatically routes:
-        - ``__PYTHON__\\n<code>`` sentinel → Pyodide (direct code execution)
-        - ``python -c "..."`` inline → Pyodide
-        - ``python script.py`` or ``python3 script.py`` → Pyodide (file-based)
-        - Suspected Python snippets → Pyodide
-        - Other commands → BusyBox shell
-
-        Args:
-            command: Shell command string to execute.
-
-        Returns:
-            ExecuteResponse with combined output, exit code, and truncation flag.
+        Routing Priority:
+        1. Explicit Sentinels (__PYTHON__, __SHELL__)
+        2. Explicit 'python'/'python3' prefix
+        3. Multi-line or complex Python structures (via AST)
+        4. Default to Shell (BusyBox)
         """
-        # Handle __PYTHON__ sentinel (produced by ToolCallContentMiddleware)
+        # Handle explicit __SHELL__ sentinel
+        shell_sentinel = f"{self._SHELL_SENTINEL}\n"
+        if command.startswith(shell_sentinel):
+            code = command[len(shell_sentinel) :]
+            logger.info("Forcing shell execution via sentinel")
+            return self._execute_shell(code)
+
+        # Handle __PYTHON__ sentinel
         sentinel_prefix = f"{self._PYTHON_SENTINEL}\n"
         if command.startswith(sentinel_prefix):
             code = command[len(sentinel_prefix) :]
@@ -973,7 +965,7 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
                 code = argv_setup + code
             return self._execute_python_code(code)
 
-        # Suspected Python snippet
+        # Suspected Python snippet (AST based)
         if self._should_route_to_pyodide(command):
             logger.info("Routing suspected Python snippet to Pyodide (%d chars)", len(command))
             return self._execute_python_code(command)
@@ -982,7 +974,15 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
 
     async def aexecute(self, command: str) -> ExecuteResponse:
         """Async version of execute."""
-        # Handle __PYTHON__ sentinel (produced by ToolCallContentMiddleware)
+        # Handle explicit __SHELL__ sentinel
+        shell_sentinel = f"{self._SHELL_SENTINEL}\n"
+        if command.startswith(shell_sentinel):
+            code = command[len(shell_sentinel) :]
+            logger.info("Forcing shell execution via sentinel")
+            result = await self._executor.execute_shell(code)
+            return self._format_shell_result(result)
+
+        # Handle __PYTHON__ sentinel
         sentinel_prefix = f"{self._PYTHON_SENTINEL}\n"
         if command.startswith(sentinel_prefix):
             code = command[len(sentinel_prefix) :]
@@ -1014,12 +1014,16 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
                 code = argv_setup + code
             return await self._aexecute_python_code(code)
 
-        # Suspected Python snippet
+        # Suspected Python snippet (AST based)
         if self._should_route_to_pyodide(command):
             logger.info("Routing suspected Python snippet to Pyodide (%d chars)", len(command))
             return await self._aexecute_python_code(command)
 
         result = await self._executor.execute_shell(command)
+        return self._format_shell_result(result)
+
+    def _format_shell_result(self, result: ExecutionResult) -> ExecuteResponse:
+        """Helper to format SandboxExecutor shell result into ExecuteResponse."""
         output = result.stdout or ""
         if result.stderr:
             output = f"{output}\n{result.stderr}" if output else result.stderr
