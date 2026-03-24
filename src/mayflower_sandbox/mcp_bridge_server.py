@@ -291,6 +291,10 @@ class MCPBridgeServer:
                 "stderr": stderr_str,
                 "result": result_obj
             }
+            # If Deno failed (e.g. PermissionDenied), ensure success is false even if result_obj exists
+            if proc.returncode != 0:
+                result["success"] = False
+                
             return "200 OK", json.dumps(result).encode("utf-8")
         finally:
             if os.path.exists(temp_path):

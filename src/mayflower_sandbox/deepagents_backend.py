@@ -897,19 +897,31 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
             return True
             
         # Common Python keywords at start
-        if stripped.startswith(("import ", "from ", "def ", "class ", "@", "await ")):
+        if stripped.startswith(("import ", "from ", "def ", "class ", "@", "await ", "if ", "for ", "while ", "try ", "with ", "async ")):
             return True
             
         # Common Python expressions
         if (stripped.startswith("print(") and stripped.endswith(")")):
             return True
             
-        # Assignments (e.g. x = 10)
-        if re.match(r"^[a-zA-Z_]\w*\s*=[^=]", stripped):
-            # Exclude shell var assignments like VAR=val (usually no space before =)
-            # and common shell commands
-            if not re.match(r"^[A-Z_]+=[^\s]+$", stripped):
-                return True
+        # Assignments (e.g. x = 10, data['x'] = 10, self.x = 10)
+        # We look for a valid target-like prefix followed by =
+        if "=" in stripped and not stripped.startswith("="):
+            # Split by first =
+            target, _ = stripped.split("=", 1)
+            target = target.strip()
+            # If target contains spaces (and isn't a simple shell var), or contains [], or ., it's likely Python
+            if "[" in target or "." in target or " " in target:
+                # Check it's not a shell comparison like [ $x = $y ]
+                if not (target.startswith("[") and stripped.endswith("]")):
+                    return True
+            # Simple identifier assignment x=10
+            if re.match(r"^[a-z_][a-z0-9_]*$", target, re.IGNORECASE):
+                # Exclude shell-style UPPER_VAR=val (usually no space)
+                if not re.match(r"^[A-Z_]+$", target):
+                    return True
+                if " =" in stripped or "= " in stripped:
+                    return True
                 
         return False
 
