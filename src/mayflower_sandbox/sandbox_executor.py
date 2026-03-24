@@ -572,7 +572,7 @@ class SandboxExecutor:
             "    from pyodide.ffi import to_js\n"
             f"    url = 'http://127.0.0.1:{port}/eval_ts'\n"
             "    # JSON dump the code twice: once for the payload, once for the JS string literal\n"
-            "    payload_data = json.dumps({'code': code, 'allow_net': " + json.dumps(self.allow_net) + "})\n"
+            "    payload_data = json.dumps({'code': code, 'allow_net': " + repr(self.allow_net) + "})\n"
             "    options = to_js({\n"
             "        'method': 'POST',\n"
             "        'body': payload_data,\n"

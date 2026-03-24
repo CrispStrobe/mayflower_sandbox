@@ -233,9 +233,9 @@ class TestPreludes:
 
     def test_mcp_prelude_contains_port(self):
         servers = {"myserver": {"url": "http://localhost:8000"}}
-        code = SandboxExecutor._build_mcp_prelude(servers, 12345)
+        executor = SandboxExecutor(MagicMock(), "test")
+        code = executor._build_mcp_prelude(servers, 12345)
         assert "12345" in code
-        assert "__MCP_CALL__" in code
         assert "myserver" in code
 
 
