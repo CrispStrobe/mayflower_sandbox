@@ -838,7 +838,7 @@ class TestErrorPaths:
         result_mock.exit_code = None
         mock_executor.execute_shell = AsyncMock(return_value=result_mock)
 
-        result = await backend.aexecute("failing_command")
+        result = await backend.aexecute("cat /nonexistent_file_xyz")
         assert result.exit_code == 1
 
     @pytest.mark.asyncio

@@ -105,9 +105,9 @@ async def cleanup_worker_pool():
     yield
     from mayflower_sandbox.sandbox_executor import SandboxExecutor
 
-    if SandboxExecutor._pool is not None:
-        await SandboxExecutor._pool.shutdown()
-        SandboxExecutor._pool = None
+    for _p in list(SandboxExecutor._pools.values()):
+        await _p.shutdown()
+    SandboxExecutor._pools.clear()
 
     if SandboxExecutor._mcp_bridge is not None:
         await SandboxExecutor._mcp_bridge.shutdown()

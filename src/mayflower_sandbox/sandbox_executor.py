@@ -59,8 +59,9 @@ class SandboxExecutor:
     - Post-saves created files back to PostgreSQL
     """
 
-    # Class-level worker pool (shared across all instances)
-    _pool: "WorkerPool | None" = None
+    # Class-level worker pools, keyed by (enable_debugger, allow_all_net, frozenset(extra_hosts))
+    # Separate pools for different network/debugger configurations prevent permission bleed.
+    _pools: "dict[tuple, WorkerPool]" = {}
     _pool_lock = asyncio.Lock()
 
     # Class-level MCP bridge (shared across all pool instances)
@@ -155,11 +156,20 @@ class SandboxExecutor:
         mcp_bridge_port: int | None = None,
         enable_debugger: bool = False,
         allow_net: bool | list[str] = False,
-    ) -> None:
-        """Ensure worker pool is started (lazy initialization)."""
-        if cls._pool is None:
+    ) -> tuple:
+        """Ensure a worker pool for this configuration exists. Returns the pool key."""
+        extra_hosts: set[str] = set()
+        allow_all_net = False
+        if isinstance(allow_net, list):
+            extra_hosts.update(allow_net)
+        elif allow_net is True:
+            allow_all_net = True
+
+        pool_key = (enable_debugger, allow_all_net, frozenset(extra_hosts))
+
+        if pool_key not in cls._pools:
             async with cls._pool_lock:
-                if cls._pool is None:  # Double-check locking
+                if pool_key not in cls._pools:  # Double-check locking
                     from .worker_pool import WorkerPool
 
                     pool_size = int(os.getenv("PYODIDE_POOL_SIZE", "3"))
@@ -167,14 +177,7 @@ class SandboxExecutor:
                         # Debugger requires predictable worker mapping
                         pool_size = 1
 
-                    logger.info(f"Initializing Pyodide worker pool (size={pool_size}, debugger={enable_debugger})...")
-
-                    extra_hosts: set[str] = set()
-                    allow_all_net = False
-                    if isinstance(allow_net, list):
-                        extra_hosts.update(allow_net)
-                    elif allow_net is True:
-                        allow_all_net = True
+                    logger.info(f"Initializing Pyodide worker pool (size={pool_size}, debugger={enable_debugger}, allow_all_net={allow_all_net}, extra_hosts={extra_hosts})...")
 
                     pool = WorkerPool(
                         size=pool_size,
@@ -186,11 +189,13 @@ class SandboxExecutor:
                     )
                     try:
                         await pool.start()
-                        cls._pool = pool  # Only set if start succeeds
+                        cls._pools[pool_key] = pool
                         logger.info("Pyodide worker pool ready!")
                     except Exception:
                         await pool.shutdown()
                         raise
+
+        return pool_key
 
     def _get_executor_path(self) -> Path:
         """Get path to TypeScript executor."""
@@ -731,9 +736,9 @@ class SandboxExecutor:
             bridge_port = await self._ensure_mcp_bridge(self.db_pool, self.thread_id, stateful=self.stateful)
 
             # Ensure pool is started with MCP bridge port and network permissions
-            await self._ensure_pool(mcp_bridge_port=bridge_port, enable_debugger=self.enable_debugger, allow_net=self.allow_net)
-
-            if self._pool is None:
+            pool_key = await self._ensure_pool(mcp_bridge_port=bridge_port, enable_debugger=self.enable_debugger, allow_net=self.allow_net)
+            pool = self._pools.get(pool_key)
+            if pool is None:
                 raise RuntimeError("Worker pool not available")
 
             # Pre-load helpers and bootstrap
@@ -759,7 +764,7 @@ class SandboxExecutor:
             files_dict = await self.vfs.get_all_files_for_pyodide()
 
             # Execute via pool
-            result = await self._pool.execute(
+            result = await pool.execute(
                 code=code_to_run,
                 thread_id=self.thread_id,
                 stateful=self.stateful,

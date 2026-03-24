@@ -18,8 +18,6 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Global lock for SQLite operations to prevent concurrent access issues in threadpool
-_SQLITE_LOCK = threading.Lock()
 
 def _translate_query(query: str) -> str:
     """Translate PostgreSQL query to SQLite syntax."""
@@ -108,61 +106,12 @@ def _translate_query(query: str) -> str:
     return query
 
 class SqliteConnection:
-    def __init__(self, conn: sqlite3.Connection):
+    def __init__(self, conn: sqlite3.Connection, lock: threading.Lock):
         self.conn = conn
+        self._lock = lock
         self.conn.row_factory = sqlite3.Row
 
-    def _inject_legacy_columns(self, query: str, args: tuple) -> tuple[str, tuple]:
-        """Inject vfs_id into legacy INSERT statements. 
-        Note: We only modify the SQL string here. SQLite's indexed ?N bindings 
-        will handle the argument reuse if we use $1, $1 -> ?1, ?1.
-        """
-        q_lower = query.lower()
-        if "vfs_id" in q_lower or "insert into" not in q_lower:
-            return query, args
-
-        is_sessions = "sandbox_sessions" in q_lower
-        is_fs = "sandbox_filesystem" in q_lower
-        
-        if not (is_sessions or is_fs):
-            return query, args
-
-        # 1. Inject 'vfs_id' into column list
-        col_list_match = re.search(r"(\(\s*thread_id\s*,)", query, flags=re.IGNORECASE | re.DOTALL)
-        if not col_list_match:
-            return query, args
-            
-        new_query = query[:col_list_match.start()] + "(thread_id, vfs_id," + query[col_list_match.end():]
-        
-        # 2. Inject value into VALUES clause
-        parts = re.split(r"VALUES", new_query, flags=re.IGNORECASE)
-        if len(parts) != 2:
-            return query, args
-            
-        prefix = parts[0]
-        values_and_rest = parts[1]
-        
-        on_conflict_parts = re.split(r"ON CONFLICT", values_and_rest, flags=re.IGNORECASE)
-        rows_part = on_conflict_parts[0]
-        suffix = " ON CONFLICT" + on_conflict_parts[1] if len(on_conflict_parts) > 1 else ""
-        
-        def duplicate_first_value(m):
-            row_content = m.group(1)
-            comma_idx = row_content.find(",")
-            if comma_idx == -1:
-                return f"({row_content}, {row_content})"
-            first_val = row_content[:comma_idx].strip()
-            return f"({first_val}, {row_content})"
-
-        new_rows_part = re.sub(r"\(\s*([^)]+)\s*\)", duplicate_first_value, rows_part)
-        new_query = f"{prefix}VALUES{new_rows_part}{suffix}"
-        
-        return new_query, args
-
     def _execute_sync(self, query: str, args: tuple) -> sqlite3.Cursor:
-        # Before translation, handle legacy column injection
-        query, args = self._inject_legacy_columns(query, args)
-        
         # We translate FIRST now to have a consistent ?N style
         query = _translate_query(query)
 
@@ -195,14 +144,14 @@ class SqliteConnection:
 
     async def fetch(self, query: str, *args: Any) -> List[Dict[str, Any]]:
         def run():
-            with _SQLITE_LOCK:
+            with self._lock:
                 cursor = self._execute_sync(query, args)
                 return [dict(row) for row in cursor.fetchall()]
         return await asyncio.to_thread(run)
 
     async def fetchrow(self, query: str, *args: Any) -> Optional[Dict[str, Any]]:
         def run():
-            with _SQLITE_LOCK:
+            with self._lock:
                 cursor = self._execute_sync(query, args)
                 row = cursor.fetchone()
                 return dict(row) if row else None
@@ -210,7 +159,7 @@ class SqliteConnection:
 
     async def fetchval(self, query: str, *args: Any) -> Any:
         def run():
-            with _SQLITE_LOCK:
+            with self._lock:
                 cursor = self._execute_sync(query, args)
                 row = cursor.fetchone()
                 if not row:
@@ -223,14 +172,13 @@ class SqliteConnection:
 
     async def execute(self, query: str, *args: Any) -> str:
         def run():
-            with _SQLITE_LOCK:
+            with self._lock:
                 if not args and ";" in query:
-                    query_injected, _ = self._inject_legacy_columns(query, ())
-                    translated = _translate_query(query_injected)
+                    translated = _translate_query(query)
                     self.conn.executescript(translated)
                     self.conn.commit()
                     return "DONE"
-                
+
                 cursor = self._execute_sync(query, args)
                 try:
                     self.conn.commit()
@@ -242,6 +190,7 @@ class SqliteConnection:
 class SqliteDatabase:
     def __init__(self, db_path: str):
         self.db_path = db_path
+        self._lock = threading.Lock()
         self._conn = sqlite3.connect(
             db_path,
             check_same_thread=False,
@@ -343,7 +292,7 @@ class SqliteDatabase:
             WHERE thread_id = NEW.thread_id AND file_path = NEW.file_path;
         END;
         """
-        with _SQLITE_LOCK:
+        with self._lock:
             self._conn.executescript(schema)
             self._conn.commit()
 
@@ -377,10 +326,10 @@ class SqliteDatabase:
 
     @asynccontextmanager
     async def acquire(self) -> AsyncIterator[SqliteConnection]:
-        yield SqliteConnection(self._conn)
+        yield SqliteConnection(self._conn, self._lock)
 
     async def close(self):
-        with _SQLITE_LOCK:
+        with self._lock:
             self._conn.close()
 
 async def create_sqlite_pool(db_path: str) -> SqliteDatabase:

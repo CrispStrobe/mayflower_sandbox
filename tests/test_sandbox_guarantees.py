@@ -391,9 +391,9 @@ except Exception as e:
     # first (clean pool), it CAN reach its allowed domain.
     # We do this by forcing a pool reset and retrying with allowed executor first.
     from mayflower_sandbox.sandbox_executor import SandboxExecutor
-    if SandboxExecutor._pool is not None:
-        await SandboxExecutor._pool.shutdown()
-        SandboxExecutor._pool = None
+    for _p in list(SandboxExecutor._pools.values()):
+        await _p.shutdown()
+    SandboxExecutor._pools.clear()
     if SandboxExecutor._mcp_bridge is not None:
         await SandboxExecutor._mcp_bridge.shutdown()
         SandboxExecutor._mcp_bridge = None

@@ -104,12 +104,15 @@ class CleanupJob:
         stats = {"files_deleted": 0, "bytes_freed": 0}
 
         async with self.db_pool.acquire() as conn:
-            # Find orphaned files
+            # Find orphaned files — a file is orphaned when NO live session still
+            # references its vfs_id (handles both isolated and collaborative mode).
             orphaned = await conn.fetch("""
-                SELECT f.thread_id, f.file_path, f.size
+                SELECT f.vfs_id, f.file_path, f.size
                 FROM sandbox_filesystem f
-                LEFT JOIN sandbox_sessions s ON f.thread_id = s.thread_id
-                WHERE s.thread_id IS NULL
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM sandbox_sessions s
+                    WHERE s.vfs_id = f.vfs_id
+                )
             """)
 
             if not orphaned:
@@ -131,7 +134,7 @@ class CleanupJob:
                 DELETE FROM sandbox_filesystem
                 WHERE NOT EXISTS (
                     SELECT 1 FROM sandbox_sessions
-                    WHERE sandbox_sessions.thread_id = sandbox_filesystem.thread_id
+                    WHERE sandbox_sessions.vfs_id = sandbox_filesystem.vfs_id
                 )
             """)
 

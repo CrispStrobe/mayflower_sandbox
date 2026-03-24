@@ -955,12 +955,9 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
                     # Function calls or awaits are likely Python
                     if isinstance(node.value, (ast.Call, ast.Await)):
                         return True
-                    # If it's a Name (ls), it's shell
-                    if isinstance(node.value, ast.Name):
-                        return False
-                    # Everything else in single-line Expr is suspect but let's be more lenient
-                    # e.g. "1+1" should be Python
-                    # But NOT if it starts with a common shell command (checked above)
+                    # Everything else (Name, BinOp, Constant, etc.) is Python
+                    # Common shell bare-word commands (ls, pwd, etc.) are already
+                    # caught by the regex check above before we reach AST parsing.
                     return True
                 
                 # Control flow etc are definitely Python

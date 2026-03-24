@@ -105,17 +105,17 @@ async def test_foreign_key_cascade(db_pool):
 
         # Create session
         await conn.execute("""
-            INSERT INTO sandbox_sessions (thread_id, expires_at)
-            VALUES ('test_123', NOW() + INTERVAL '1 day')
+            INSERT INTO sandbox_sessions (thread_id, expires_at, vfs_id)
+            VALUES ('test_123', NOW() + INTERVAL '1 day', 'test_123')
         """)
 
         # Create file
         await conn.execute(
             """
             INSERT INTO sandbox_filesystem (
-                thread_id, file_path, content, content_type, size
+                thread_id, vfs_id, file_path, content, content_type, size
             ) VALUES (
-                'test_123', '/tmp/test.txt', $1, 'text/plain', 11
+                'test_123', 'test_123', '/tmp/test.txt', $1, 'text/plain', 11
             )
         """,
             b"hello world",
@@ -142,8 +142,8 @@ async def test_file_size_constraint(db_pool):
 
         # Create session
         await conn.execute("""
-            INSERT INTO sandbox_sessions (thread_id, expires_at)
-            VALUES ('test_456', NOW() + INTERVAL '1 day')
+            INSERT INTO sandbox_sessions (thread_id, expires_at, vfs_id)
+            VALUES ('test_456', NOW() + INTERVAL '1 day', 'test_456')
         """)
 
         # Try to insert file larger than 20MB
@@ -153,9 +153,9 @@ async def test_file_size_constraint(db_pool):
             await conn.execute(
                 """
                 INSERT INTO sandbox_filesystem (
-                    thread_id, file_path, content, content_type, size
+                    thread_id, vfs_id, file_path, content, content_type, size
                 ) VALUES (
-                    'test_456', '/tmp/large.bin', $1, 'application/octet-stream', $2
+                    'test_456', 'test_456', '/tmp/large.bin', $1, 'application/octet-stream', $2
                 )
             """,
                 large_content,

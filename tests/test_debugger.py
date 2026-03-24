@@ -35,9 +35,9 @@ async def test_debugger_flag_passed_to_worker(db_pool):
         
         executor = SandboxExecutor(db_pool, "debug_thread", enable_debugger=True)
         
-        # Reset the shared pool
-        SandboxExecutor._pool = None
-        
+        # Reset any existing pools
+        SandboxExecutor._pools.clear()
+
         # Trigger pool creation
         await executor._ensure_pool(enable_debugger=True)
         
