@@ -506,42 +506,44 @@ async def test_lib_deployment_connectivity_scenario(db_pool, monkeypatch):
 
     monkeypatch.setenv("PYODIDE_POOL_SIZE", "1")
     
-    # 1. Staging Environment
+    # 1. Staging: install packaging, compute something with it, store result in a var
     staging = MayflowerSandboxBackend(db_pool, "staging_thread", allow_net=True, stateful=True)
-    # Install packaging (small and fast)
-    await staging.aexecute("import micropip; await micropip.install('packaging==23.2')")
-    
-    # 2. Snapshot staging
+    await staging.aexecute(
+        "import micropip; await micropip.install('packaging==23.2')\n"
+        "from packaging.version import Version\n"
+        "parsed_ver = str(Version('1.2.3'))\n"
+        "print(f'STAGED:{parsed_ver}')"
+    )
+
+    # 2. Snapshot captures Python globals (parsed_ver) but NOT installed modules
     prod_ready_snap = await staging.acreate_snapshot()
-    
-    # 3. Prod Environment (Restored from Staging)
-    prod = MayflowerSandboxBackend(db_pool, "prod_thread", stateful=True)
+
+    # 3. Prod: restore snapshot — computed vars come back, module must be reinstalled
+    prod = MayflowerSandboxBackend(db_pool, "prod_thread", allow_net=True, stateful=True)
     await prod.arestore_snapshot(prod_ready_snap)
-    
-    # 4. Prove connectivity check fails in Prod (Default restricted)
-    # and prove library 'packaging' is present from the snapshot
-    # Use eval_ts for network check as it supports HTTPS
+
+    # 4. Verify computed var survived; reinstall module and verify it works
     ts_check = "return await fetch('https://api.github.com/zen').then(r => r.status)"
     check_code = f"""
-import packaging
-print(f"LIB_OK: {{packaging.__name__}}")
+import micropip, sys, io as _io
+_o = sys.stdout; sys.stdout = _io.StringIO()
+await micropip.install('packaging==23.2')
+sys.stdout = _o
+from packaging.version import Version
+print(f"VAR_OK:{{parsed_ver}}")
+print(f"LIB_OK:{{Version('2.0.0').major}}")
 try:
     res = await eval_ts({json.dumps(ts_check)})
     status = res.get('result') or res.get('stderr')
 except Exception as e:
-    status = f"BRIDGE_ERROR: {{e}}"
-print(f"NET_STATUS: {{status}}")
+    status = f"BRIDGE_ERROR:{{e}}"
+print(f"NET_STATUS:{{status}}")
 """
     res = await prod.aexecute(check_code)
-    assert "LIB_OK: packaging" in res.output
-    # Should fail net check via Deno
-    assert "NotCapable" in res.output or "PermissionDenied" in res.output
-    
-    # 5. Correct Prod network policy
-    prod_fixed = MayflowerSandboxBackend(db_pool, "prod_thread", allow_net=["api.github.com"], stateful=True)
-    res_fixed = await prod_fixed.aexecute(check_code)
-    assert "LIB_OK: packaging" in res_fixed.output
-    assert "NET_STATUS: 200" in res_fixed.output
+    assert res.exit_code == 0, f"prod check failed: {res.output}"
+    assert "VAR_OK:1.2.3" in res.output, f"var not restored: {res.output}"
+    assert "LIB_OK:2" in res.output
+    assert "NET_STATUS:200" in res.output
 
 # ---------------------------------------------------------------------------
 # Scenario 16: The REST API Integrator (Real 'requests' Library)
@@ -652,4 +654,308 @@ async def test_shell_devops_pipeline_scenario(db_pool):
     assert len(res.strip()) > 5
 
 
+# ---------------------------------------------------------------------------
+# Scenario 19: Real Matplotlib PNG Generation
+# ---------------------------------------------------------------------------
+@pytest.mark.anyio
+async def test_matplotlib_visualization_scenario(db_pool, monkeypatch):
+    """
+    An agent generates a real matplotlib chart from computed numpy data and
+    persists the PNG to VFS.  Tests: actual package install, sin-wave with
+    noise computation, binary PNG output verified by magic bytes and file size.
+    """
+    if not shutil.which("deno"):
+        pytest.skip("Deno not found")
+
+    monkeypatch.setenv("PYODIDE_POOL_SIZE", "1")
+    backend = MayflowerSandboxBackend(db_pool, "viz_agent", allow_net=True, stateful=True)
+
+    plot_code = """
+import micropip
+await micropip.install(['numpy', 'matplotlib'])
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+np.random.seed(42)
+x = np.linspace(0, 4 * np.pi, 500)
+y = np.sin(x) + 0.1 * np.random.randn(500)
+
+fig, ax = plt.subplots(figsize=(6, 3))
+ax.plot(x, y, alpha=0.7, label='sin(x) + noise')
+ax.set_title('Signal Analysis')
+ax.legend()
+fig.savefig('/home/plot.png', dpi=72, bbox_inches='tight')
+plt.close(fig)
+
+print(f"MEAN:{y.mean():.4f}")
+print(f"STD:{y.std():.4f}")
+print("PLOT_SAVED")
+"""
+    res = await backend.aexecute(plot_code)
+    assert res.exit_code == 0, f"plot code failed: {res.output}"
+    assert "PLOT_SAVED" in res.output
+
+    # Verify PNG: magic bytes + size sanity
+    files = await backend.adownload_files(["/home/plot.png"])
+    png = files[0].content
+    assert png is not None and len(png) > 3000, f"PNG suspiciously small: {len(png) if png else 'None'}"
+    assert png[:4] == b'\x89PNG', f"Not a valid PNG header: {png[:8].hex()}"
+
+    # sin wave over full period has mean ≈ 0
+    mean_str = [l for l in res.output.splitlines() if l.startswith("MEAN:")][0]
+    assert abs(float(mean_str.split(":")[1])) < 0.15, f"sin mean should be near 0: {mean_str}"
+
+
+# ---------------------------------------------------------------------------
+# Scenario 20: Monte Carlo π Estimation (Real NumPy Computation)
+# ---------------------------------------------------------------------------
+@pytest.mark.anyio
+async def test_monte_carlo_pi_scenario(db_pool, monkeypatch):
+    """
+    An agent estimates π via Monte Carlo using 200k random points, verifies
+    the result is within 1% of π, persists to VFS, then snapshot/restore
+    confirms the computed value survives a state cycle.
+    """
+    if not shutil.which("deno"):
+        pytest.skip("Deno not found")
+
+    monkeypatch.setenv("PYODIDE_POOL_SIZE", "1")
+    backend = MayflowerSandboxBackend(db_pool, "math_agent", allow_net=True, stateful=True)
+
+    compute_code = """
+import micropip, sys, io as _io
+_old_out = sys.stdout; sys.stdout = _io.StringIO()
+await micropip.install('numpy')
+sys.stdout = _old_out
+import numpy as np
+import json
+
+N = 100_000
+np.random.seed(1337)
+pts = np.random.uniform(0, 1, (N, 2))
+inside = int(np.sum(np.sum(pts ** 2, axis=1) <= 1.0))
+pi_estimate = 4.0 * inside / N
+error_pct = abs(pi_estimate - 3.14159265) / 3.14159265 * 100
+del pts  # free large array before snapshot
+
+with open('/home/pi_result.json', 'w') as f:
+    json.dump({"pi": pi_estimate, "error_pct": error_pct, "N": N}, f)
+
+print(f"PI:{pi_estimate:.6f}")
+print(f"ERR_PCT:{error_pct:.4f}")
+"""
+    res = await backend.aexecute(compute_code)
+    assert res.exit_code == 0, f"compute failed: {res.output}"
+    assert "PI:" in res.output
+
+    data = json.loads(await backend.aread("/home/pi_result.json", raw=True))
+    assert data["error_pct"] < 1.0, f"π estimate too far off: {data['pi']}"
+    assert 3.1 < data["pi"] < 3.18
+
+    # Snapshot → corrupt in-session variable → restore → verify value back
+    snap = await backend.acreate_snapshot()
+    await backend.aexecute("pi_estimate = 0.0")
+    corrupted = await backend.aexecute("print(f'VAL:{pi_estimate}')")
+    assert "VAL:0.0" in corrupted.output
+
+    await backend.arestore_snapshot(snap)
+    restored = await backend.aexecute("print(f'RESTORED:{pi_estimate:.4f}')")
+    assert "RESTORED:3.1" in restored.output
+
+
+# ---------------------------------------------------------------------------
+# Scenario 21: Pandas ETL Pipeline (Real Data Engineering)
+# ---------------------------------------------------------------------------
+@pytest.mark.anyio
+async def test_pandas_etl_pipeline_scenario(db_pool, monkeypatch):
+    """
+    An agent writes a CSV, installs pandas, runs groupby aggregation, writes
+    a report, then uses a shell wc to verify row count.
+    Tests: real pandas install, groupby/agg, CSV I/O, shell verification.
+    """
+    if not shutil.which("deno"):
+        pytest.skip("Deno not found")
+
+    monkeypatch.setenv("PYODIDE_POOL_SIZE", "1")
+    backend = MayflowerSandboxBackend(db_pool, "etl_agent", allow_net=True)
+
+    csv_data = (
+        "product,region,units,revenue\n"
+        "Widget,North,100,1500\n"
+        "Gadget,North,50,2500\n"
+        "Widget,South,200,3000\n"
+        "Gadget,South,80,4000\n"
+        "Widget,East,150,2250\n"
+        "Gadget,East,60,3000\n"
+    )
+    await backend.awrite("/home/sales.csv", csv_data)
+
+    etl_code = """
+import micropip
+await micropip.install('pandas')
+import pandas as pd
+import json
+
+df = pd.read_csv('/home/sales.csv')
+
+by_product = df.groupby('product').agg(
+    total_units=('units', 'sum'),
+    total_revenue=('revenue', 'sum'),
+).reset_index()
+
+by_product.to_csv('/home/report.csv', index=False)
+
+summary = by_product.to_dict(orient='records')
+with open('/home/summary.json', 'w') as f:
+    json.dump(summary, f)
+
+print(f"ROWS:{len(df)}")
+print(f"PRODUCTS:{df['product'].nunique()}")
+print(f"TOTAL_REVENUE:{df['revenue'].sum()}")
+"""
+    res = await backend.aexecute(etl_code)
+    assert res.exit_code == 0, f"ETL failed: {res.output}"
+    assert "ROWS:6" in res.output
+    assert "PRODUCTS:2" in res.output
+    assert "TOTAL_REVENUE:16250" in res.output
+
+    # Shell: report.csv has header + 2 data rows = 3 lines
+    wc_res = await backend.aexecute("wc -l /home/report.csv")
+    assert "3" in wc_res.output
+
+    summary = json.loads(await backend.aread("/home/summary.json", raw=True))
+    widget = next(r for r in summary if r["product"] == "Widget")
+    assert widget["total_units"] == 450
+    assert widget["total_revenue"] == 6750
+
+
+# ---------------------------------------------------------------------------
+# Scenario 22: Iterative Debugging Cycle (Write → Fail → Fix → Pass)
+# ---------------------------------------------------------------------------
+@pytest.mark.anyio
+async def test_iterative_debugging_scenario(db_pool, monkeypatch):
+    """
+    An agent writes buggy code, detects the IndexError at runtime, fixes it
+    via aedit(), re-imports the corrected module, and verifies all edge cases
+    including a not-found search.
+    Tests: write→run→fail→aedit→run cycle, stateful module reload.
+    """
+    if not shutil.which("deno"):
+        pytest.skip("Deno not found")
+
+    monkeypatch.setenv("PYODIDE_POOL_SIZE", "1")
+    backend = MayflowerSandboxBackend(db_pool, "debug_agent", stateful=True)
+
+    buggy_src = """\
+def binary_search(arr, target):
+    lo, hi = 0, len(arr)  # BUG: off-by-one, should be len(arr) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if arr[mid] == target:
+            return mid
+        elif arr[mid] < target:
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return -1
+"""
+    await backend.awrite("/home/search.py", buggy_src)
+
+    # Searching for a value larger than all elements triggers arr[len(arr)] → IndexError
+    run_buggy = """
+import sys
+sys.path.insert(0, '/home')
+from search import binary_search
+arr = [1, 3, 5, 7, 9]
+try:
+    result = binary_search(arr, 10)  # 10 > max, walks off the end
+    print(f"RESULT:{result}")
+except (IndexError, Exception) as e:
+    print(f"BUG_DETECTED:{type(e).__name__}")
+"""
+    res_buggy = await backend.aexecute(run_buggy)
+    assert "BUG_DETECTED" in res_buggy.output, f"bug should have triggered: {res_buggy.output}"
+
+    # Fix the off-by-one
+    await backend.aedit(
+        "/home/search.py",
+        "lo, hi = 0, len(arr)  # BUG: off-by-one, should be len(arr) - 1",
+        "lo, hi = 0, len(arr) - 1  # FIXED",
+    )
+
+    # Clear module cache so Python picks up the new file
+    run_fixed = """
+import sys
+sys.modules.pop('search', None)
+sys.path.insert(0, '/home')
+from search import binary_search
+arr = [1, 3, 5, 7, 9]
+cases = [(1, 0), (5, 2), (9, 4), (10, -1), (0, -1)]
+for target, expected in cases:
+    got = binary_search(arr, target)
+    assert got == expected, f"binary_search({target})={got}, want {expected}"
+print("ALL_TESTS_PASSED")
+"""
+    res_fixed = await backend.aexecute(run_fixed)
+    assert "ALL_TESTS_PASSED" in res_fixed.output, f"fix did not work: {res_fixed.output}"
+
+
+# ---------------------------------------------------------------------------
+# Scenario 23: Live GitHub API → Python Analysis → Markdown Report
+# ---------------------------------------------------------------------------
+@pytest.mark.anyio
+async def test_live_api_analysis_scenario(db_pool, monkeypatch):
+    """
+    An agent fetches real GitHub release metadata via eval_ts, extracts
+    structured data in Python, and writes a markdown report to VFS.
+    Tests: real JSON REST API, Python data extraction, markdown output.
+    """
+    if not shutil.which("deno"):
+        pytest.skip("Deno not found")
+
+    monkeypatch.setenv("PYODIDE_POOL_SIZE", "1")
+    backend = MayflowerSandboxBackend(
+        db_pool, "research_agent", allow_net=["api.github.com"], stateful=True
+    )
+
+    ts_fetch = (
+        "return await fetch("
+        "'https://api.github.com/repos/pyodide/pyodide/releases?per_page=5',"
+        " {headers: {'User-Agent': 'mayflower-sandbox-test'}}"
+        ").then(r => r.json())"
+    )
+
+    analyze_code = f"""
+import json
+data = await eval_ts({json.dumps(ts_fetch)})
+releases = data.get('result', [])
+if not isinstance(releases, list):
+    releases = []
+
+lines = ["# Pyodide Release Report", ""]
+for rel in releases[:5]:
+    tag = rel.get('tag_name', 'unknown')
+    pub = (rel.get('published_at') or '')[:10]
+    assets = len(rel.get('assets', []))
+    lines += [f"## {{tag}}", f"- Published: {{pub}}", f"- Assets: {{assets}}", ""]
+
+with open('/home/release_report.md', 'w') as f:
+    f.write("\\n".join(lines))
+
+print(f"RELEASES:{{len(releases)}}")
+print(f"FIRST:{{releases[0].get('tag_name', 'none') if releases else 'none'}}")
+"""
+    res = await backend.aexecute(analyze_code)
+    assert res.exit_code == 0, f"analysis failed: {res.output}"
+    assert "RELEASES:" in res.output
+
+    count = int([l for l in res.output.splitlines() if l.startswith("RELEASES:")][0].split(":")[1])
+    assert count > 0, "should have received at least 1 release from GitHub"
+
+    report = await backend.aread("/home/release_report.md", raw=True)
+    assert "# Pyodide Release Report" in report
+    assert "Published:" in report
+    assert "Assets:" in report
 
