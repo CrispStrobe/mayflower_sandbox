@@ -34,8 +34,26 @@ print(content)
 2. **Specialized Roles**: One agent can generate data (e.g. a scraper) while another analyzes it (e.g. a data scientist) using the same workspace.
 3. **Session Resumption**: You can spawn a new thread to "inspect" an existing workspace without affecting the original thread's memory state.
 
+## Session Lifecycle and Shared Files
+
+When a session ends (or is deleted), only that session's row is removed. Files in a shared workspace are kept alive as long as **any** session sharing the same `vfs_id` still exists — they are only cleaned up once the last session using that `vfs_id` is gone.
+
+This means it is safe to tear down individual agent sessions mid-project without losing shared files:
+
+```python
+# Both agents share vfs_id="project_alpha"
+agent_1 = MayflowerSandboxBackend(db_pool, thread_id="dev_1", vfs_id="project_alpha")
+agent_2 = MayflowerSandboxBackend(db_pool, thread_id="dev_2", vfs_id="project_alpha")
+
+# agent_1 finishes its work and its session is cleaned up
+await agent_1.adelete_session()
+
+# Files written by agent_1 are still accessible via agent_2
+content = await agent_2.aread("/index.html")  # still works
+```
+
 ## Conflict Resolution
 
-Mayflower Sandbox uses **Last-Write-Wins** at the database level for shared workspaces. If two agents write to the same file path simultaneously, the database transaction that completes last will persist. 
+Mayflower Sandbox uses **Last-Write-Wins** at the database level for shared workspaces. If two agents write to the same file path simultaneously, the database transaction that completes last will persist.
 
 For high-concurrency collaborative editing, it is recommended to have agents work in different directories within the shared workspace.
