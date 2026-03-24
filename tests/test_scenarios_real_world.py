@@ -417,3 +417,130 @@ print(f"CHECKSUM: {checksum}")
     # 4. Final verification
     assert await backend._vfs.file_exists("/home/input.bin")
 
+# ---------------------------------------------------------------------------
+# Scenario 13: The Web Scraping Pipeline (Shell + Python + Edit)
+# ---------------------------------------------------------------------------
+@pytest.mark.anyio
+async def test_scraping_pipeline_scenario(db_pool):
+    """
+    Scenario 13: Download data via shell, process via Python, finalize via Edit.
+    """
+    if not shutil.which("deno"):
+        pytest.skip("Deno not found")
+
+    backend = MayflowerSandboxBackend(db_pool, "scraper", allow_net=True)
+    
+    # 1. Shell: Download (simulated with local write if wget fails, but here we try real)
+    # Using api.github.com/zen which is small and fast
+    # Use eval_ts for robust https download
+    ts_download = "return await fetch('https://api.github.com/zen').then(r => r.text())"
+    await backend.aexecute(f"content = await eval_ts({json.dumps(ts_download)}); open('/home/quote.txt', 'w').write(content['result'])")
+    
+    # 2. Python: Process into JSON
+    code = """
+import os
+import json
+with open('/home/quote.txt', 'r') as f:
+    text = f.read().strip()
+
+with open('/home/data.json', 'w') as f:
+    json.dump({'quote': text, 'status': 'draft'}, f)
+print("Data processed")
+"""
+    await backend.aexecute(code)
+    
+    # 3. Edit: finalize status
+    await backend.aedit("/home/data.json", '"status": "draft"', '"status": "published"')
+    
+    # 4. Verify
+    res = await backend.aread("/home/data.json", raw=True)
+    assert "published" in res
+    assert "quote" in res
+
+# ---------------------------------------------------------------------------
+# Scenario 14: The Security Investigative Audit (Shell Analysis + Redaction)
+# ---------------------------------------------------------------------------
+@pytest.mark.anyio
+async def test_security_audit_remediation_scenario(db_pool):
+    """
+    Scenario 14: Investigate logs for secrets, take snapshot, and redact.
+    """
+    if not shutil.which("deno"):
+        pytest.skip("Deno not found")
+
+    backend = MayflowerSandboxBackend(db_pool, "auditor", stateful=True)
+    
+    # 1. Prepare messy logs
+    await backend.awrite("/home/logs.txt", "ERROR: auth failure\nINFO: user logged in\nSECRET: api_key_12345_top_secret\n")
+    
+    # 2. Shell: Search for secrets
+    audit_res = await backend.aexecute("grep 'SECRET' /home/logs.txt")
+    assert "api_key_12345" in audit_res.output
+    
+    # 3. Snapshot before destructive change
+    snap = await backend.acreate_snapshot()
+    
+    # 4. Python/Edit: Redact
+    await backend.aedit("/home/logs.txt", "SECRET: api_key_12345_top_secret", "SECRET: [REDACTED]")
+    
+    # 5. Verify redaction
+    clean_res = await backend.aread("/home/logs.txt", raw=True)
+    assert "[REDACTED]" in clean_res
+    assert "api_key_12345" not in clean_res
+    
+    # 6. Rollback to verify initial evidence is still in snapshot
+    await backend.arestore_snapshot(snap)
+    old_res = await backend.aread("/home/logs.txt", raw=True)
+    assert "api_key_12345" in old_res
+
+# ---------------------------------------------------------------------------
+# Scenario 15: Library Deployment & Connectivity (Staging to Prod)
+# ---------------------------------------------------------------------------
+@pytest.mark.anyio
+async def test_lib_deployment_connectivity_scenario(db_pool, monkeypatch):
+    """
+    Scenario 15: Install lib in staging, snapshot, restore to prod, check egress.
+    """
+    if not shutil.which("deno"):
+        pytest.skip("Deno not found")
+
+    monkeypatch.setenv("PYODIDE_POOL_SIZE", "1")
+    
+    # 1. Staging Environment
+    staging = MayflowerSandboxBackend(db_pool, "staging_thread", allow_net=True, stateful=True)
+    # Install packaging (small and fast)
+    await staging.aexecute("import micropip; await micropip.install('packaging==23.2')")
+    
+    # 2. Snapshot staging
+    prod_ready_snap = await staging.acreate_snapshot()
+    
+    # 3. Prod Environment (Restored from Staging)
+    prod = MayflowerSandboxBackend(db_pool, "prod_thread", stateful=True)
+    await prod.arestore_snapshot(prod_ready_snap)
+    
+    # 4. Prove connectivity check fails in Prod (Default restricted)
+    # and prove library 'packaging' is present from the snapshot
+    # Use eval_ts for network check as it supports HTTPS
+    ts_check = "return await fetch('https://api.github.com/zen').then(r => r.status)"
+    check_code = f"""
+import packaging
+print(f"LIB_OK: {{packaging.__name__}}")
+try:
+    res = await eval_ts({json.dumps(ts_check)})
+    status = res.get('result') or res.get('stderr')
+except Exception as e:
+    status = f"BRIDGE_ERROR: {{e}}"
+print(f"NET_STATUS: {{status}}")
+"""
+    res = await prod.aexecute(check_code)
+    assert "LIB_OK: packaging" in res.output
+    # Should fail net check via Deno
+    assert "NotCapable" in res.output or "PermissionDenied" in res.output
+    
+    # 5. Correct Prod network policy
+    prod_fixed = MayflowerSandboxBackend(db_pool, "prod_thread", allow_net=["api.github.com"], stateful=True)
+    res_fixed = await prod_fixed.aexecute(check_code)
+    assert "LIB_OK: packaging" in res_fixed.output
+    assert "NET_STATUS: 200" in res_fixed.output
+
+
