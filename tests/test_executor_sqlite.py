@@ -83,8 +83,8 @@ async def test_vfs_preload(executor, db_pool, clean_files):
     async with db_pool.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO sandbox_filesystem (thread_id, file_path, content, content_type, size)
-            VALUES ('test_sandbox', '/tmp/data.txt', $1, 'text/plain', $2)
+            INSERT INTO sandbox_filesystem (thread_id, vfs_id, file_path, content, content_type, size)
+            VALUES ('test_sandbox', 'test_sandbox', '/tmp/data.txt', $1, 'text/plain', $2)
         """,
             b"Hello from VFS!",
             16,
@@ -136,8 +136,8 @@ async def test_vfs_roundtrip(executor, db_pool, clean_files):
     async with db_pool.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO sandbox_filesystem (thread_id, file_path, content, content_type, size)
-            VALUES ('test_sandbox', '/data/input.csv', $1, 'text/csv', $2)
+            INSERT INTO sandbox_filesystem (thread_id, vfs_id, file_path, content, content_type, size)
+            VALUES ('test_sandbox', 'test_sandbox', '/data/input.csv', $1, 'text/csv', $2)
         """,
             b"a,b\n1,2\n3,4",
             11,
