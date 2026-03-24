@@ -517,8 +517,7 @@ class SandboxExecutor:
         port = sock.getsockname()[1]
         return server, port
 
-    @staticmethod
-    def _build_mcp_prelude(servers: dict[str, dict[str, Any]], port: int) -> str:
+    def _build_mcp_prelude(self, servers: dict[str, dict[str, Any]], port: int) -> str:
         config_literal = json.dumps(servers)
         return (
             "import json\n"
@@ -573,7 +572,7 @@ class SandboxExecutor:
             "    from pyodide.ffi import to_js\n"
             f"    url = 'http://127.0.0.1:{port}/eval_ts'\n"
             "    # JSON dump the code twice: once for the payload, once for the JS string literal\n"
-            "    payload_data = json.dumps({'code': code})\n"
+            "    payload_data = json.dumps({'code': code, 'allow_net': " + json.dumps(self.allow_net) + "})\n"
             "    options = to_js({\n"
             "        'method': 'POST',\n"
             "        'body': payload_data,\n"

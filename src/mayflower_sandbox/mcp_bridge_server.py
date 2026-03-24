@@ -228,28 +228,73 @@ class MCPBridgeServer:
             json.dumps({"result": result}, default=self._json_default).encode("utf-8"),
         )
 
-    async def _execute_ts_eval(self, code: str) -> tuple[str, bytes]:
+    async def _execute_ts_eval(self, code: str, allow_net: bool | list[str] = False) -> tuple[str, bytes]:
         """Evaluate TypeScript code via Deno (Feature 8)."""
-        import subprocess
+        import tempfile
+        import os
+        
+        # Wrap code in an async IIFE so it can use top-level await/return
+        # and print the result as JSON
+        wrapped_code = f"""
+        (async () => {{
+            try {{
+                const result = await (async () => {{
+                    {code}
+                }})();
+                console.log("MAYFLOWER_JSON_START" + JSON.stringify(result) + "MAYFLOWER_JSON_END");
+            }} catch (e) {{
+                console.error(e);
+                Deno.exit(1);
+            }}
+        }})();
+        """
+        
+        fd, temp_path = tempfile.mkstemp(suffix=".ts")
         try:
-            # We use subprocess here for a clean environment, 
-            # or we could try to use the same process if we were running in Deno.
-            # But the bridge is a Python process.
+            with os.fdopen(fd, 'w') as f:
+                f.write(wrapped_code)
+            
+            cmd = ["deno", "run"]
+            if allow_net is True:
+                cmd.append("--allow-net")
+            elif isinstance(allow_net, list):
+                cmd.append(f"--allow-net={','.join(allow_net)}")
+            
+            cmd.append(temp_path)
+            
             proc = await asyncio.create_subprocess_exec(
-                "deno", "eval", code,
+                *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, stderr = await proc.communicate()
             
+            stdout_str = stdout.decode(errors="replace")
+            stderr_str = stderr.decode(errors="replace")
+            
+            # Extract JSON result if present
+            result_obj = None
+            if "MAYFLOWER_JSON_START" in stdout_str:
+                import re
+                match = re.search(r"MAYFLOWER_JSON_START(.*?)MAYFLOWER_JSON_END", stdout_str, re.DOTALL)
+                if match:
+                    try:
+                        result_obj = json.loads(match.group(1))
+                        # Clean up stdout
+                        stdout_str = stdout_str.replace(match.group(0), "").strip()
+                    except:
+                        pass
+
             result = {
                 "success": proc.returncode == 0,
-                "stdout": stdout.decode(errors="replace"),
-                "stderr": stderr.decode(errors="replace"),
+                "stdout": stdout_str,
+                "stderr": stderr_str,
+                "result": result_obj
             }
             return "200 OK", json.dumps(result).encode("utf-8")
-        except Exception as e:
-            return "500 Internal Server Error", json.dumps({"error": str(e)}).encode("utf-8")
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
 
     async def _execute_cache_package(self, data: dict) -> tuple[str, bytes]:
         """Store a package wheel in the cache (Feature 1)."""
@@ -337,7 +382,8 @@ class MCPBridgeServer:
             if method == "POST" and path == "/eval_ts":
                 data = json.loads(payload.decode("utf-8"))
                 code = data.get("code", "")
-                status, body = await self._execute_ts_eval(code)
+                allow_net = data.get("allow_net", False)
+                status, body = await self._execute_ts_eval(code, allow_net=allow_net)
             elif method == "POST" and path == "/cache_package":
                 data = json.loads(payload.decode("utf-8"))
                 status, body = await self._execute_cache_package(data)

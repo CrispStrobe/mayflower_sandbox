@@ -304,6 +304,7 @@ class SqliteDatabase:
             auth TEXT,
             schemas TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            vfs_id TEXT,
             PRIMARY KEY (thread_id, name)
         );
 
@@ -357,6 +358,13 @@ class SqliteDatabase:
         try:
             self._conn.execute("ALTER TABLE sandbox_filesystem ADD COLUMN vfs_id TEXT")
             self._conn.execute("UPDATE sandbox_filesystem SET vfs_id = thread_id WHERE vfs_id IS NULL")
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            self._conn.execute("ALTER TABLE sandbox_mcp_servers ADD COLUMN vfs_id TEXT")
+            self._conn.execute("UPDATE sandbox_mcp_servers SET vfs_id = thread_id WHERE vfs_id IS NULL")
             self._conn.commit()
         except sqlite3.OperationalError:
             pass
