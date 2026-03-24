@@ -150,7 +150,12 @@ class SandboxExecutor:
         return cls._mcp_bridge.port if cls._mcp_bridge else None
 
     @classmethod
-    async def _ensure_pool(cls, mcp_bridge_port: int | None = None, enable_debugger: bool = False) -> None:
+    async def _ensure_pool(
+        cls,
+        mcp_bridge_port: int | None = None,
+        enable_debugger: bool = False,
+        allow_net: bool | list[str] = False,
+    ) -> None:
         """Ensure worker pool is started (lazy initialization)."""
         if cls._pool is None:
             async with cls._pool_lock:
@@ -161,14 +166,23 @@ class SandboxExecutor:
                     if enable_debugger:
                         # Debugger requires predictable worker mapping
                         pool_size = 1
-                    
+
                     logger.info(f"Initializing Pyodide worker pool (size={pool_size}, debugger={enable_debugger})...")
+
+                    extra_hosts: set[str] = set()
+                    allow_all_net = False
+                    if isinstance(allow_net, list):
+                        extra_hosts.update(allow_net)
+                    elif allow_net is True:
+                        allow_all_net = True
 
                     pool = WorkerPool(
                         size=pool_size,
                         executor_path=Path(__file__).parent,
                         mcp_bridge_port=mcp_bridge_port,
                         enable_debugger=enable_debugger,
+                        extra_allowed_hosts=extra_hosts,
+                        allow_all_net=allow_all_net,
                     )
                     try:
                         await pool.start()
@@ -716,8 +730,8 @@ class SandboxExecutor:
             # Start MCP bridge if needed (before pool, so port is available)
             bridge_port = await self._ensure_mcp_bridge(self.db_pool, self.thread_id, stateful=self.stateful)
 
-            # Ensure pool is started with MCP bridge port
-            await self._ensure_pool(mcp_bridge_port=bridge_port, enable_debugger=self.enable_debugger)
+            # Ensure pool is started with MCP bridge port and network permissions
+            await self._ensure_pool(mcp_bridge_port=bridge_port, enable_debugger=self.enable_debugger, allow_net=self.allow_net)
 
             if self._pool is None:
                 raise RuntimeError("Worker pool not available")

@@ -91,7 +91,14 @@ except ImportError:
   await pyodide.runPythonAsync(`
 _session_bytes = bytes(${JSON.stringify(Array.from(sessionBytes))})
 _session_obj = cloudpickle.loads(_session_bytes)
+# Clear all user-defined names before applying session to prevent state
+# from a previous thread's execution leaking into this session.
+_skip = frozenset({'_session_bytes', '_session_obj', '_skip', 'cloudpickle', 'micropip'})
+for _k in [k for k in list(globals()) if not k.startswith('__') and k not in _skip]:
+    del globals()[_k]
+globals().pop('_k', None)
 globals().update(_session_obj)
+del _session_bytes, _session_obj, _skip
 `);
 }
 
@@ -141,6 +148,27 @@ interface ExecutionContext {
   stdoutBuffer: { value: string };
   stderrBuffer: { value: string };
   stdoutDecoder: TextDecoder;
+}
+
+/**
+ * Clear user-defined globals for a fresh stateful session on this worker.
+ * Prevents state from a previous thread's execution bleeding into a new thread
+ * that has no prior session bytes.
+ */
+async function clearGlobals(ctx: ExecutionContext): Promise<void> {
+  try {
+    ctx.pyodide.setStdout(createSuppressedStdout());
+    await ctx.pyodide.runPythonAsync(`
+_skip = frozenset({'_skip', 'cloudpickle', 'micropip'})
+for _k in [k for k in list(globals()) if not k.startswith('__') and k not in _skip]:
+    del globals()[_k]
+globals().pop('_k', None)
+`);
+  } catch (e: unknown) {
+    ctx.stderrBuffer.value += `Global clear error: ${errorToString(e)}\n`;
+  } finally {
+    ctx.pyodide.setStdout(createStdoutHandler(ctx.stdoutBuffer, ctx.stdoutDecoder));
+  }
 }
 
 /**
@@ -274,9 +302,15 @@ if 'matplotlib' not in sys.modules:
       this.pyodide.setStdout(createStdoutHandler(ctx.stdoutBuffer, ctx.stdoutDecoder));
       this.pyodide.setStderr(createStdoutHandler(ctx.stderrBuffer, new TextDecoder()));
 
-      // Restore session if needed
-      if (params.stateful && params.session_bytes) {
-        await tryRestoreSession(ctx, params.session_bytes);
+      // Restore session if needed (or clear globals for fresh stateful session)
+      if (params.stateful) {
+        if (params.session_bytes) {
+          await tryRestoreSession(ctx, params.session_bytes);
+        } else {
+          // No prior session bytes — clear globals so a fresh thread does not
+          // inherit state left behind by a previous thread on this worker.
+          await clearGlobals(ctx);
+        }
       }
 
       // Mount files if provided

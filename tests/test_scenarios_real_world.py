@@ -543,4 +543,113 @@ print(f"NET_STATUS: {{status}}")
     assert "LIB_OK: packaging" in res_fixed.output
     assert "NET_STATUS: 200" in res_fixed.output
 
+# ---------------------------------------------------------------------------
+# Scenario 16: The REST API Integrator (Real 'requests' Library)
+# ---------------------------------------------------------------------------
+@pytest.mark.anyio
+async def test_real_requests_rest_api_scenario(db_pool, monkeypatch):
+    """
+    Scenario 16: Use the real 'requests' library to call a REST API.
+    Tests: pyodide-http patch + allow_net + memory persistence.
+    """
+    if not shutil.which("deno"):
+        pytest.skip("Deno not found")
+
+    monkeypatch.setenv("PYODIDE_POOL_SIZE", "1")
+    backend = MayflowerSandboxBackend(db_pool, "api_agent", allow_net=["api.github.com"], stateful=True)
+    
+    # 1. First call: Initialize and fetch
+    # We must install 'requests' first (it's often pre-installed in Pyodide, but let's be sure)
+    setup_code = """
+import micropip
+await micropip.install('requests')
+import requests
+resp = requests.get('https://api.github.com/zen')
+status = resp.status_code
+quote = resp.text
+print(f"FETCH_OK: {status}")
+"""
+    res = await backend.aexecute(setup_code)
+    assert "FETCH_OK: 200" in res.output
+    
+    # 2. Second call: verify state persistence of the 'quote' and 'requests' availability
+    verify_code = """
+print(f"PERSISTED_QUOTE: {quote}")
+print(f"PERSISTED_STATUS: {status}")
+"""
+    res_verify = await backend.aexecute(verify_code)
+    assert "PERSISTED_STATUS: 200" in res_verify.output
+    assert len(res_verify.output) > 20
+
+# ---------------------------------------------------------------------------
+# Scenario 17: The Dynamic Package Deployer (Real 'pip' Install)
+# ---------------------------------------------------------------------------
+@pytest.mark.anyio
+async def test_dynamic_package_install_scenario(db_pool, monkeypatch):
+    """
+    Scenario 17: Agent needs a specialized library (faker) to generate test data.
+    Tests: Real micropip (pip) install + file IO + cache persistence.
+    """
+    if not shutil.which("deno"):
+        pytest.skip("Deno not found")
+
+    monkeypatch.setenv("PYODIDE_POOL_SIZE", "1")
+    # Allow net for PyPI and GitHub (wheels)
+    backend = MayflowerSandboxBackend(db_pool, "data_gen_agent", allow_net=True, stateful=True)
+    
+    # 1. Install specialized lib
+    install_code = """
+import micropip
+await micropip.install('faker')
+from faker import Faker
+import json
+from decimal import Decimal
+fake = Faker()
+profile = fake.profile()
+# Faker profiles include Decimal fields (coordinates) - use default=str to serialize
+with open('/home/profile.json', 'w') as f:
+    json.dump(profile, f, default=str)
+print(f"GEN_OK: {profile['username']}")
+"""
+    res = await backend.aexecute(install_code)
+    assert "GEN_OK" in res.output
+    
+    # 2. Verify file exists in VFS
+    assert await backend._vfs.file_exists("/home/profile.json")
+    content = json.loads(await backend.aread("/home/profile.json", raw=True))
+    assert "username" in content
+
+# ---------------------------------------------------------------------------
+# Scenario 18: The Shell DevOps (Real 'curl' + Pipe Pipeline)
+# ---------------------------------------------------------------------------
+@pytest.mark.anyio
+async def test_shell_devops_pipeline_scenario(db_pool):
+    """
+    Scenario 18: Use BusyBox curl/wget to fetch a site and process via shell pipes.
+    Tests: Shell networking + VFS interaction.
+    """
+    if not shutil.which("deno"):
+        pytest.skip("Deno not found")
+
+    backend = MayflowerSandboxBackend(db_pool, "devops_agent", allow_net=True)
+    
+    # 1. Fetch a site header via eval_ts (bridge) because BusyBox wget lacks HTTPS
+    # Use eval_ts for robust https download
+    ts_download = "return await fetch('https://api.github.com/zen').then(r => r.text())"
+    # Result from eval_ts is a dict with 'result' containing the zen string
+    # Ensure trailing newline so BusyBox cat flushes its output through the pipeline
+    await backend.aexecute(f"res = await eval_ts({json.dumps(ts_download)}); open('/home/zen.txt', 'w').write(res.get('result', '').strip() + '\\n')")
+
+    # 2. Use a complex shell pipeline to count characters and transform
+    # (BusyBox supports wc, tr, etc)
+    pipeline = "cat /home/zen.txt | tr 'a-z' 'A-Z' > /home/zen_upper.txt"
+    await backend.aexecute(pipeline)
+
+    # 3. Verify result
+    res = await backend.aread("/home/zen_upper.txt", raw=True)
+    # BusyBox tr range syntax: output should be all uppercase or already-upper chars
+    assert res.strip() == res.strip().upper()
+    assert len(res.strip()) > 5
+
+
 

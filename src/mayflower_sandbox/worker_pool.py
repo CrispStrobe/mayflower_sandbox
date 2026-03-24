@@ -31,11 +31,13 @@ class PyodideWorker:
         executor_path: Path,
         allowed_hosts: set[str] | None = None,
         enable_debugger: bool = False,
+        allow_all_net: bool = False,
     ):
         self.worker_id = worker_id
         self.executor_path = executor_path
         self.allowed_hosts = allowed_hosts or self.DEFAULT_ALLOWED_HOSTS.copy()
         self.enable_debugger = enable_debugger
+        self.allow_all_net = allow_all_net
         self.process: Process | None = None
         self.busy = False
         self.request_count = 0
@@ -88,13 +90,10 @@ class PyodideWorker:
         # Store the event loop this worker is bound to
         self._loop = asyncio.get_running_loop()
 
-        # Build network permission string from allowed hosts
-        allowed_hosts_str = ",".join(sorted(self.allowed_hosts))
-
         cmd = [
             "deno",
             "run",
-            f"--allow-net={allowed_hosts_str}",
+            "--allow-net" if self.allow_all_net else f"--allow-net={','.join(sorted(self.allowed_hosts))}",
             "--allow-read",
             "--allow-write",
         ]
@@ -299,11 +298,15 @@ class WorkerPool:
         executor_path: Path | None = None,
         mcp_bridge_port: int | None = None,
         enable_debugger: bool = False,
+        extra_allowed_hosts: set[str] | None = None,
+        allow_all_net: bool = False,
     ):
         self.size = size
         self.executor_path = executor_path or Path(__file__).parent
         self.mcp_bridge_port = mcp_bridge_port
         self.enable_debugger = enable_debugger
+        self.extra_allowed_hosts = extra_allowed_hosts or set()
+        self.allow_all_net = allow_all_net
         self.workers: list[PyodideWorker] = []
         self.next_worker_idx = 0
         self.started = False
@@ -318,19 +321,22 @@ class WorkerPool:
 
         logger.info(f"Starting worker pool (size={self.size})...")
 
-        # Build allowed hosts including MCP bridge if configured
+        # Build allowed hosts including MCP bridge and any extra hosts from executor
         self._allowed_hosts = PyodideWorker.DEFAULT_ALLOWED_HOSTS.copy()
         if self.mcp_bridge_port:
             self._allowed_hosts.add(f"127.0.0.1:{self.mcp_bridge_port}")
             logger.info(f"MCP bridge configured on port {self.mcp_bridge_port}")
+        if self.extra_allowed_hosts:
+            self._allowed_hosts.update(self.extra_allowed_hosts)
 
         # Create workers with allowed hosts
         self.workers = [
             PyodideWorker(
-                i, 
-                self.executor_path, 
-                self._allowed_hosts, 
-                enable_debugger=self.enable_debugger
+                i,
+                self.executor_path,
+                self._allowed_hosts,
+                enable_debugger=self.enable_debugger,
+                allow_all_net=self.allow_all_net,
             ) for i in range(self.size)
         ]
 
