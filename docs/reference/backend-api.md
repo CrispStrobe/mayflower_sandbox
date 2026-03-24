@@ -14,11 +14,13 @@ Full sandbox backend with Python and shell execution, plus file operations.
 from mayflower_sandbox import MayflowerSandboxBackend
 
 backend = MayflowerSandboxBackend(
-    db_pool: Any,              # asyncpg connection pool
+    db_pool: Any,              # Database connection pool (PostgreSQL or SQLite)
     thread_id: str,            # unique session/user identifier
     *,
-    allow_net: bool = False,   # allow network access in Pyodide
+    vfs_id: str | None = None, # optional shared VFS workspace
+    allow_net: bool | list[str] = False, # allow network access (True, False, or domain list)
     stateful: bool = True,     # persist variables across executions
+    enable_debugger: bool = False, # enable Deno inspector
     timeout_seconds: float = 60.0,  # execution timeout
 )
 ```
@@ -26,7 +28,8 @@ backend = MayflowerSandboxBackend(
 ### Properties
 
 ```python
-backend.id  # returns "mayflower:<thread_id>"
+backend.id      # returns "mayflower:<thread_id>"
+backend.vfs_id  # returns the shared workspace identifier
 ```
 
 ### execute / aexecute
@@ -58,6 +61,15 @@ Create a new file. Fails if the file already exists.
 ```python
 def write(self, file_path: str, content: str) -> WriteResult
 async def awrite(self, file_path: str, content: str) -> WriteResult
+```
+
+### delete / adelete
+
+Delete a file from the VFS.
+
+```python
+def delete(self, file_path: str) -> bool
+async def adelete(self, file_path: str) -> bool
 ```
 
 ### edit / aedit
@@ -134,6 +146,26 @@ Batch download files as binary.
 ```python
 def download_files(self, paths: list[str]) -> list[FileDownloadResponse]
 async def adownload_files(self, paths: list[str]) -> list[FileDownloadResponse]
+```
+
+### create_snapshot / acreate_snapshot
+
+Create a point-in-time snapshot of the current session state.
+
+```python
+def create_snapshot(self, ttl_days: int = 1) -> str
+async def acreate_snapshot(self, ttl_days: int = 1) -> str
+```
+
+Returns the new `snapshot_id`.
+
+### restore_snapshot / arestore_snapshot
+
+Restore the current session from a previous snapshot.
+
+```python
+def restore_snapshot(self, snapshot_id: str) -> None
+async def arestore_snapshot(self, snapshot_id: str) -> None
 ```
 
 ### consume_pending_files_update

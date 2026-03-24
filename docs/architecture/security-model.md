@@ -34,20 +34,25 @@ echo hello | cat | grep hello
 
 Each Worker gets its own BusyBox WASM instance, preventing global-state contamination between pipeline stages.
 
-## Thread Isolation
+## Thread & Workspace Isolation
 
-Complete data isolation between users/sessions via PostgreSQL `thread_id`:
+Data isolation is enforced via the database schema using both `thread_id` and `vfs_id`:
 
-- Files are partitioned by `thread_id` (composite primary key)
-- Sessions are isolated by `thread_id`
-- Execution state is isolated by `thread_id`
-- No cross-thread access is possible at the database level
+- **Isolation by Default**: By default, `vfs_id` equals `thread_id`, providing complete isolation between users.
+- **Collaborative Workspaces**: By explicitly providing a shared `vfs_id`, multiple threads can access the same persistent storage pool while maintaining separate execution memory.
+- **Foreign Key Constraints**: Files are partitioned by `vfs_id`, and sessions are isolated by `thread_id`.
 
 ```sql
--- Files are always scoped to a thread
-PRIMARY KEY (thread_id, file_path)
+-- VFS isolation is based on vfs_id
+PRIMARY KEY (vfs_id, file_path)
 FOREIGN KEY (thread_id) REFERENCES sandbox_sessions(thread_id) ON DELETE CASCADE
 ```
+
+## VFS Snapshots
+
+Snapshots allow creating transient, isolated clones of session state:
+- **Instant Rollback**: Clones the entire VFS and memory state into a new `thread_id`.
+- **Automatic Cleanup**: Snapshots are linked to the parent thread via `parent_thread_id` and use `ON DELETE CASCADE`. Deleting the parent thread automatically purges all its snapshots.
 
 ## Path Validation
 
@@ -72,13 +77,14 @@ This prevents denial-of-service through excessive storage consumption.
 
 ## Network Access Control
 
-Network access is disabled by default and controlled per backend instance:
+Network access is disabled by default and can be configured with high precision:
 
-- **Default** (`allow_net=False`): No outbound network access from Pyodide
-- **Enabled** (`allow_net=True`): Allows `cdn.jsdelivr.net` for micropip and the local MCP bridge (`127.0.0.1`)
-- **MCP bridge**: Communication with MCP servers uses a localhost-only bridge, keeping Pyodide sandboxed
-- **Custom hosts**: Use `MAYFLOWER_SANDBOX_NET_ALLOW` to whitelist additional hosts
-- **MCP allowlist**: Use `MAYFLOWER_MCP_ALLOWLIST` to restrict which MCP servers can be bound
+- **Disabled** (`allow_net=False`): No outbound network access.
+- **Full Access** (`allow_net=True`): Allows all outbound traffic.
+- **Fine-grained Allowlist** (`allow_net=["api.github.com"]`): Only permits traffic to specific domains.
+- **Mandatory Defaults**: Critical infrastructure domains (e.g., PyPI, `cdn.jsdelivr.net` for Pyodide, and `127.0.0.1` for the MCP bridge) are automatically whitelisted when any network access is enabled.
+
+Enforcement happens at the **Deno capability boundary**, ensuring that even compromised sandbox code cannot escape the specified allowlist.
 
 ## Session Expiration
 

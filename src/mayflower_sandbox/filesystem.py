@@ -194,7 +194,6 @@ class VirtualFilesystem:
             )
 
             logger.debug(f"Wrote file {normalized_path} ({size} bytes) for vfs {self.vfs_id}")
-            print(f"DEBUG: VFS {self.vfs_id} wrote {normalized_path} result_vfs={result['vfs_id'] if result else 'NONE'}")
 
             return dict(result) if result else {}
 
@@ -224,12 +223,10 @@ class VirtualFilesystem:
             )
 
             if not result:
-                print(f"DEBUG: VFS {self.vfs_id} NOT FOUND {normalized_path}")
                 raise FileNotFoundError(
                     f"File {normalized_path} not found in thread {self.thread_id}"
                 )
 
-            print(f"DEBUG: VFS {self.vfs_id} read {normalized_path} result_vfs={result['vfs_id']}")
             return dict(result)
 
     async def delete_file(self, file_path: str) -> bool:

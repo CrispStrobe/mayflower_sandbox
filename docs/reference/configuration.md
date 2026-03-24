@@ -55,28 +55,33 @@ psql -d mayflower_test -f migrations/001_sandbox_schema.sql
 
 ### sandbox_sessions
 
-Tracks active sessions with automatic expiration.
+Tracks active sessions with automatic expiration and links to snapshots/workspaces.
 
 ```sql
 CREATE TABLE sandbox_sessions (
     thread_id TEXT PRIMARY KEY,
     created_at TIMESTAMPTZ DEFAULT NOW(),
-    expires_at TIMESTAMPTZ DEFAULT NOW() + INTERVAL '180 days'
+    expires_at TIMESTAMPTZ DEFAULT NOW() + INTERVAL '180 days',
+    metadata JSONB DEFAULT '{}'::jsonb,
+    parent_thread_id TEXT REFERENCES sandbox_sessions(thread_id) ON DELETE CASCADE,
+    vfs_id TEXT
 );
 ```
 
 ### sandbox_filesystem
 
-Stores files with a 20MB-per-file limit, isolated by `thread_id`.
+Stores files with a 20MB-per-file limit, partitioned by `vfs_id`.
 
 ```sql
 CREATE TABLE sandbox_filesystem (
     thread_id TEXT NOT NULL,
+    vfs_id TEXT NOT NULL,
     file_path TEXT NOT NULL,
     content BYTEA NOT NULL CHECK (octet_length(content) <= 20971520),
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
-    PRIMARY KEY (thread_id, file_path),
+    metadata JSONB DEFAULT '{}'::jsonb,
+    PRIMARY KEY (vfs_id, file_path),
     FOREIGN KEY (thread_id) REFERENCES sandbox_sessions(thread_id) ON DELETE CASCADE
 );
 ```
@@ -92,6 +97,22 @@ CREATE TABLE sandbox_session_bytes (
     session_metadata JSONB,
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     FOREIGN KEY (thread_id) REFERENCES sandbox_sessions(thread_id) ON DELETE CASCADE
+);
+```
+
+### sandbox_package_cache
+
+Caches `micropip` wheel files for faster installations.
+
+```sql
+CREATE TABLE sandbox_package_cache (
+    package_name TEXT NOT NULL,
+    version TEXT NOT NULL,
+    pyodide_version TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    content BYTEA NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (package_name, version, pyodide_version)
 );
 ```
 
@@ -112,19 +133,17 @@ Stores MCP server bindings and connection metadata.
 - Increase for high-concurrency workloads
 - Reduce to 1--2 for memory-constrained environments
 
-### Request Limit
+### Debugger Support
 
-Workers are recycled after `PYODIDE_WORKER_REQUEST_LIMIT` requests to prevent memory leaks from long-running Pyodide instances. Lower values increase recycling frequency (and brief cold starts) but reduce memory growth.
-
-### Health Check Interval
-
-Controls how often the pool verifies worker responsiveness. Lower values detect problems faster but add overhead.
+- `enable_debugger=True`: Starts Deno workers with the `--inspect` flag.
+- Default port is 9229. If using a pool, ports are assigned dynamically.
 
 ## Network Access Control
 
 - Default: Network disabled (`allow_net=False`)
-- `allow_net=True`: Enables Pyodide network for micropip package installation
-- CDN traffic (`cdn.jsdelivr.net`) is always allowed when network is enabled
-- MCP bridge communication uses `127.0.0.1:<port>` (localhost only)
-- Use `MAYFLOWER_SANDBOX_NET_ALLOW` to whitelist additional hosts
-- Use `MAYFLOWER_MCP_ALLOWLIST` to restrict which MCP servers can be bound
+- `allow_net=True`: Enables full outbound network access.
+- `allow_net=["domain.com"]`: Restricts egress to specific domains only.
+- CDN traffic (`cdn.jsdelivr.net`) and PyPI (`pypi.org`, `files.pythonhosted.org`) are always allowed when any network access is enabled.
+- MCP bridge communication uses `127.0.0.1:<port>` (localhost only).
+- Use `MAYFLOWER_SANDBOX_NET_ALLOW` to whitelist additional hosts via environment variables.
+

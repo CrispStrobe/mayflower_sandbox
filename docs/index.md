@@ -13,6 +13,12 @@ Execute untrusted Python code via Pyodide WebAssembly, run shell commands via Bu
 
 - [Document Processing](how-to/document-processing.md) -- Use and create document helpers (Word, Excel, PowerPoint, PDF)
 - [Skills & MCP](how-to/skills-and-mcp.md) -- Install Claude Skills and bind MCP servers
+- [VFS Snapshots](how-to/vfs-snapshots.md) -- Create state clones for experimentation and rollback
+- [Network Control](how-to/network-control.md) -- Fine-grained domain allowlisting for egress security
+- [Collaborative Workspaces](how-to/collaborative-workspaces.md) -- Shared VFS storage for multi-agent collaboration
+- [TypeScript Bridge](how-to/typescript-bridge.md) -- Execute TypeScript from within your Python sandbox
+- [Package Caching](how-to/package-caching.md) -- Faster library installs via database wheel cache
+- [Debugging](how-to/debugging.md) -- Attach Chrome DevTools/VS Code to the sandbox
 - [Deployment](how-to/deployment.md) -- Docker, testing, quality checks, production configuration
 - [Troubleshooting](how-to/troubleshooting.md) -- Common issues and solutions
 

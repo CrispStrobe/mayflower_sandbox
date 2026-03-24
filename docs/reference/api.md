@@ -12,18 +12,24 @@ Main executor for running Python code with VFS integration.
 from mayflower_sandbox import SandboxExecutor
 
 executor = SandboxExecutor(
-    db_pool: asyncpg.Pool,
+    db_pool: Any,
     thread_id: str,
-    allow_net: bool = False,
+    vfs_id: str | None = None,
+    allow_net: bool | list[str] = False,
+    stateful: bool = False,
+    enable_debugger: bool = False,
     timeout_seconds: float = 120.0
 )
 ```
 
 ### Parameters
 
-- `db_pool` (asyncpg.Pool): PostgreSQL connection pool
-- `thread_id` (str): Unique identifier for thread/user isolation
-- `allow_net` (bool): Enable network access in Pyodide
+- `db_pool` (Any): Database connection pool (PostgreSQL or SQLite)
+- `thread_id` (str): Unique identifier for thread/session isolation
+- `vfs_id` (str, optional): Shared identifier for persistent storage. Defaults to `thread_id`.
+- `allow_net` (bool | list[str]): Enable network access. Can be a boolean or a list of allowed domains.
+- `stateful` (bool): Maintain state between executions
+- `enable_debugger` (bool): Enable Deno inspector for debugging
 - `timeout_seconds` (float): Maximum execution time
 
 ### Methods
@@ -58,9 +64,11 @@ Executor with persistent state across executions.
 from mayflower_sandbox.session import StatefulExecutor
 
 executor = StatefulExecutor(
-    db_pool: asyncpg.Pool,
+    db_pool: Any,
     thread_id: str,
-    allow_net: bool = False,
+    vfs_id: str | None = None,
+    allow_net: bool | list[str] = False,
+    enable_debugger: bool = False,
     timeout_seconds: float = 120.0
 )
 ```
@@ -90,7 +98,7 @@ PostgreSQL-backed virtual filesystem.
 ```python
 from mayflower_sandbox.filesystem import VirtualFilesystem
 
-vfs = VirtualFilesystem(db_pool: asyncpg.Pool, thread_id: str)
+vfs = VirtualFilesystem(db_pool: Any, thread_id: str, vfs_id: str | None = None)
 ```
 
 ### Methods
@@ -164,7 +172,7 @@ Manages sandbox sessions and lifecycle.
 ```python
 from mayflower_sandbox.manager import SandboxManager
 
-manager = SandboxManager(db_pool: asyncpg.Pool)
+manager = SandboxManager(db_pool: Any)
 ```
 
 ### Methods
@@ -174,7 +182,8 @@ manager = SandboxManager(db_pool: asyncpg.Pool)
 ```python
 await manager.create_session(
     thread_id: str,
-    expiration_days: int = 180
+    expiration_days: int = 180,
+    vfs_id: str | None = None
 )
 ```
 
@@ -183,10 +192,35 @@ Create new session.
 #### get_or_create_session()
 
 ```python
-await manager.get_or_create_session(thread_id: str)
+await manager.get_or_create_session(
+    thread_id: str,
+    vfs_id: str | None = None
+)
 ```
 
 Get existing session or create new one.
+
+#### create_snapshot()
+
+```python
+snapshot_id = await manager.create_snapshot(
+    thread_id: str, 
+    ttl_days: int = 1
+)
+```
+
+Create a point-in-time snapshot of a session (VFS + memory).
+
+#### restore_snapshot()
+
+```python
+await manager.restore_snapshot(
+    snapshot_id: str, 
+    target_thread_id: str | None = None
+)
+```
+
+Restore a snapshot to a target session. Overwrites current state.
 
 #### session_exists()
 
@@ -233,7 +267,7 @@ HTTP server for file downloads.
 from mayflower_sandbox.server import FileServer
 
 server = FileServer(
-    db_pool: asyncpg.Pool,
+    db_pool: Any,
     host: str = "0.0.0.0",
     port: int = 8000
 )
@@ -263,7 +297,7 @@ Automatic cleanup of expired sessions.
 from mayflower_sandbox.cleanup import CleanupJob
 
 cleanup = CleanupJob(
-    db_pool: asyncpg.Pool,
+    db_pool: Any,
     interval_seconds: int = 3600
 )
 ```
@@ -306,7 +340,10 @@ Stop periodic cleanup.
 CREATE TABLE sandbox_sessions (
     thread_id TEXT PRIMARY KEY,
     created_at TIMESTAMPTZ DEFAULT NOW(),
-    expires_at TIMESTAMPTZ DEFAULT NOW() + INTERVAL '180 days'
+    expires_at TIMESTAMPTZ DEFAULT NOW() + INTERVAL '180 days',
+    metadata JSONB DEFAULT '{}'::jsonb,
+    parent_thread_id TEXT REFERENCES sandbox_sessions(thread_id) ON DELETE CASCADE,
+    vfs_id TEXT
 );
 ```
 
@@ -315,11 +352,13 @@ CREATE TABLE sandbox_sessions (
 ```sql
 CREATE TABLE sandbox_filesystem (
     thread_id TEXT NOT NULL,
+    vfs_id TEXT NOT NULL,
     file_path TEXT NOT NULL,
     content BYTEA NOT NULL CHECK (octet_length(content) <= 20971520),
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
-    PRIMARY KEY (thread_id, file_path),
+    metadata JSONB DEFAULT '{}'::jsonb,
+    PRIMARY KEY (vfs_id, file_path),
     FOREIGN KEY (thread_id) REFERENCES sandbox_sessions(thread_id) ON DELETE CASCADE
 );
 ```
@@ -333,6 +372,20 @@ CREATE TABLE sandbox_session_bytes (
     session_metadata JSONB,
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     FOREIGN KEY (thread_id) REFERENCES sandbox_sessions(thread_id) ON DELETE CASCADE
+);
+```
+
+### sandbox_package_cache
+
+```sql
+CREATE TABLE sandbox_package_cache (
+    package_name TEXT NOT NULL,
+    version TEXT NOT NULL,
+    pyodide_version TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    content BYTEA NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (package_name, version, pyodide_version)
 );
 ```
 
