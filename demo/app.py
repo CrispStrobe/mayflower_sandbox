@@ -18,6 +18,7 @@ load_dotenv()
 
 # Set pool size to 1 for demo stability/noise reduction
 os.environ.setdefault("PYODIDE_POOL_SIZE", "1")
+os.environ.setdefault("MAYFLOWER_PREINSTALL_PACKAGES", "true")
 
 # ── Logging setup ──────────────────────────────────────────────────────────────
 logging.basicConfig(

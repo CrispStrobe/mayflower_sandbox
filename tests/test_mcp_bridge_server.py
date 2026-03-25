@@ -116,8 +116,15 @@ async def test_bridge_rejects_unregistered_server(db_pool, clean_mcp_servers):
         writer.write(request.encode())
         await writer.drain()
 
-        response = await reader.read(4096)
-        response_text = response.decode()
+        # Read until EOF to ensure we get the body
+        response_parts = []
+        while True:
+            chunk = await reader.read(4096)
+            if not chunk:
+                break
+            response_parts.append(chunk)
+        
+        response_text = b"".join(response_parts).decode()
 
         assert "500 Internal Server Error" in response_text
         assert "not registered" in response_text

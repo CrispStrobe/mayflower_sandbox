@@ -154,9 +154,6 @@ _skipped_vars = []
 for k, v in _globals_snapshot.items():
     if k.startswith('_'):
         continue
-    # Skip modules (they should be re-imported in next turn)
-    if isinstance(v, types.ModuleType):
-        continue
     if isinstance(v, type) and v.__module__ == 'builtins':
         continue
     if hasattr(v, 'read') or hasattr(v, 'write'):
@@ -165,7 +162,6 @@ for k, v in _globals_snapshot.items():
         continue
     
     # Heuristic to avoid pickling massive data structures (> 2MB)
-    # which cause MemoryError on restore in the limited Pyodide heap.
     try:
         if hasattr(v, 'nbytes') and v.nbytes > 2 * 1024 * 1024:
             _skipped_vars.append(f"{k} ({v.nbytes / 1024 / 1024:.1f}MB)")
@@ -348,9 +344,9 @@ import micropip
 # Configure matplotlib for non-interactive backend
 os.environ['MPLBACKEND'] = 'Agg'
 
-# Pre-install common heavy modules to speed up first execution
-# These are handled by micropip which uses the database cache if available
-await micropip.install(['numpy', 'matplotlib', 'pandas'])
+# Pre-install common heavy modules if requested (e.g. for demo)
+if os.getenv('MAYFLOWER_PREINSTALL_PACKAGES') == 'true':
+    await micropip.install(['numpy', 'matplotlib', 'pandas'])
 `);
 
     this.initialized = true;

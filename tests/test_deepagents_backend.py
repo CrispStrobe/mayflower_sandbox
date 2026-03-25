@@ -336,7 +336,7 @@ class TestMayflowerSandboxBackend:
         )
         result = await backend.als_info("/dir")
         assert len(result) == 3  # 2 files + 1 subdir
-        paths = [r["path"] for r in result]
+        paths = [r.path for r in result]
         assert "/dir/file1.txt" in paths
         assert "/dir/file2.txt" in paths
         assert "/dir/subdir/" in paths
@@ -352,7 +352,7 @@ class TestMayflowerSandboxBackend:
         )
         result = await backend.aglob_info("*.py", path="/src")
         assert len(result) == 2
-        assert all(r["path"].endswith(".py") for r in result)
+        assert all(r.path.endswith(".py") for r in result)
 
     @pytest.mark.asyncio
     async def test_aupload_files_success(self, backend, mock_vfs):

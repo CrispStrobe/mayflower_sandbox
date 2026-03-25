@@ -57,9 +57,10 @@ class TestReadLargeLine:
         w = PyodideWorker(0, Path("/fake"))
         reader = AsyncMock()
         # Return chunks without newline to trigger size limit
-        big_chunk = b"x" * (5 * 1024 * 1024)
-        reader.read = AsyncMock(side_effect=[big_chunk, big_chunk, big_chunk])
-        with pytest.raises(RuntimeError, match="10MB"):
+        big_chunk = b"x" * (10 * 1024 * 1024)
+        # Need > 50MB to trigger
+        reader.read = AsyncMock(side_effect=[big_chunk] * 6)
+        with pytest.raises(RuntimeError, match="50MB limit"):
             await w._read_large_line(reader)
 
     @pytest.mark.asyncio

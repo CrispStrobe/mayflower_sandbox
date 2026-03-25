@@ -143,7 +143,7 @@ class TestPostgresBackendIntegration:
 
         # List /app
         infos = await backend.als_info("/app")
-        paths = [info["path"] for info in infos]
+        paths = [info.path for info in infos]
 
         assert "/app/main.py" in paths
         assert "/app/utils.py" in paths

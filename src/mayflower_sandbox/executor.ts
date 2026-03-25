@@ -163,9 +163,6 @@ _session_dict = {}
 for k, v in _globals_snapshot.items():
     if k.startswith('_'):
         continue
-    # Skip modules
-    if isinstance(v, types.ModuleType):
-        continue
     if isinstance(v, type) and v.__module__ == 'builtins':
         continue
     if hasattr(v, 'read') or hasattr(v, 'write'):
@@ -222,8 +219,9 @@ import micropip
 # Configure matplotlib for non-interactive backend
 os.environ['MPLBACKEND'] = 'Agg'
 
-# Pre-install common modules
-await micropip.install(['numpy', 'matplotlib', 'pandas'])
+# Pre-install common modules if requested
+if os.getenv('MAYFLOWER_PREINSTALL_PACKAGES') == 'true':
+    await micropip.install(['numpy', 'matplotlib', 'pandas'])
 `);
   } catch {
     // environment config failed - not critical, continue anyway
