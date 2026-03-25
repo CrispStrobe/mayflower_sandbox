@@ -1,10 +1,10 @@
 import asyncio
 import json
-import logging
 import os
-import sys
 import tempfile
 import uuid
+import logging
+import sys
 from pathlib import Path
 from typing import Any, cast
 
@@ -34,7 +34,7 @@ from mayflower_sandbox.db import create_sqlite_pool  # type: ignore # noqa: E402
 from mayflower_sandbox.deepagents_backend import (  # type: ignore # noqa: E402
     MayflowerSandboxBackend,
 )
-from mayflower_sandbox.sandbox_executor import ExecutionResult  # type: ignore # noqa: E402
+from mayflower_sandbox.sandbox_executor import ExecutionResult # type: ignore # noqa: E402
 
 _DB_PATH = os.getenv("MAYFLOWER_DB_PATH", "/tmp/mayflower_demo.db")  # nosec B108
 _pool: Any = None
@@ -51,15 +51,12 @@ async def _get_pool() -> Any:
 
 
 try:
-    from config import DEFAULT_CHAT_MODEL, DEFAULT_CHAT_PROVIDER
-    from config import PROVIDERS as CONFIG_PROVIDERS
+    from config import DEFAULT_CHAT_MODEL, DEFAULT_CHAT_PROVIDER, PROVIDERS as CONFIG_PROVIDERS
 except ImportError:
     try:
-        from demo.config import DEFAULT_CHAT_MODEL, DEFAULT_CHAT_PROVIDER
-        from demo.config import PROVIDERS as CONFIG_PROVIDERS
+        from demo.config import DEFAULT_CHAT_MODEL, DEFAULT_CHAT_PROVIDER, PROVIDERS as CONFIG_PROVIDERS
     except ImportError:
-        from .config import DEFAULT_CHAT_MODEL, DEFAULT_CHAT_PROVIDER
-        from .config import PROVIDERS as CONFIG_PROVIDERS
+        from .config import DEFAULT_CHAT_MODEL, DEFAULT_CHAT_PROVIDER, PROVIDERS as CONFIG_PROVIDERS
 
 # ── Providers and Models ─────────────────────────────────────────────────────
 PROVIDERS: dict[str, dict[str, Any]] = cast("dict[str, dict[str, Any]]", CONFIG_PROVIDERS.copy())
@@ -172,7 +169,7 @@ async def _run_tool(
 ) -> tuple[ExecutionResult, list[tuple[str, bytes]]]:
     """Execute one tool call. Returns (raw_result, [(path, bytes), ...])."""
     logger.info(f"Tool execution: {name}({json.dumps(args)})")
-
+    
     if name == "run_python":
         result = await backend._executor.execute(args.get("code", ""))
     elif name == "shell":
@@ -186,7 +183,7 @@ async def _run_tool(
     try:
         vfs_files = await backend.als_info("/home")
         target_paths = []
-
+        
         for f in vfs_files:
             # Robust attribute access
             is_dir = f.is_dir if hasattr(f, "is_dir") else f.get("is_dir", False)
@@ -199,7 +196,7 @@ async def _run_tool(
                 continue
 
             if path not in last_seen or modified_at != last_seen[path]:
-                logger.info(f"New/updated file: {path} (mtime: {modified_at})")
+                logger.info(f"New/updated file detected: {path} (mtime: {modified_at})")
                 target_paths.append(path)
                 last_seen[path] = modified_at
 
@@ -228,10 +225,11 @@ async def respond(
     api_url: str,
     api_key: str,
     model: str,
+    llm_history: list[dict[str, Any]],
 ):
-    """Async generator yielding (history, session_id) on every UI update."""
+    """Async generator yielding (history, session_id, llm_history) on every UI update."""
     if not user_msg.strip():
-        yield history, session_id
+        yield history, session_id, llm_history
         return
 
     logger.info(f"Message from {session_id}: {user_msg[:50]}...")
@@ -244,22 +242,20 @@ async def respond(
         stateful=True,
         timeout_seconds=120.0,
     )
-    # Prevent redundant preloading log noise
-    backend._executor._helpers_loaded = True
 
     client = AsyncOpenAI(
         base_url=(api_url or "http://localhost:11434/v1").rstrip("/"),
         api_key=api_key or "ollama",
     )
 
-    llm_msgs: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
-    for m in history:
-        if isinstance(m.get("content"), str):
-            llm_msgs.append({"role": m["role"], "content": m["content"]})
-    llm_msgs.append({"role": "user", "content": user_msg})
-
+    # Initialize llm_history if empty
+    if not llm_history:
+        llm_history = [{"role": "system", "content": SYSTEM_PROMPT}]
+    
+    # Append user message to both technical and UI history
+    llm_history.append({"role": "user", "content": user_msg})
     history = list(history) + [{"role": "user", "content": user_msg}]
-    yield history, session_id
+    yield history, session_id, llm_history
 
     for _iteration in range(20):
         text_acc = ""
@@ -269,7 +265,7 @@ async def respond(
         try:
             stream = await client.chat.completions.create(
                 model=model,
-                messages=llm_msgs,  # type: ignore
+                messages=llm_history,  # type: ignore
                 tools=cast("Any", TOOLS),
                 tool_choice="auto",
                 stream=True,
@@ -277,7 +273,7 @@ async def respond(
             )
         except Exception as exc:
             history.append({"role": "assistant", "content": f"❌ **API error:** {exc}"})
-            yield history, session_id
+            yield history, session_id, llm_history
             return
 
         async for chunk in stream:
@@ -287,12 +283,13 @@ async def respond(
 
             if delta.content:
                 text_acc += delta.content
+                history = list(history)
                 if stream_msg_idx is None:
                     history.append({"role": "assistant", "content": text_acc})
                     stream_msg_idx = len(history) - 1
                 else:
                     history[stream_msg_idx]["content"] = text_acc
-                yield history, session_id
+                yield history, session_id, llm_history
 
             if delta.tool_calls:
                 for tc in delta.tool_calls:
@@ -308,11 +305,12 @@ async def respond(
                             tc_acc[i]["arguments"] += tc.function.arguments
 
         if text_acc:
-            llm_msgs.append({"role": "assistant", "content": text_acc})
+            llm_history.append({"role": "assistant", "content": text_acc})
 
         if not tc_acc:
             break
 
+        # ── Build the assistant tool-call message ──────────────────────────
         tc_list = []
         for i in sorted(tc_acc):
             tc = tc_acc[i]
@@ -325,9 +323,9 @@ async def respond(
                     "function": {"name": tc["name"], "arguments": tc["arguments"]},
                 }
             )
+        llm_history.append({"role": "assistant", "content": text_acc or None, "tool_calls": tc_list})
 
-        llm_msgs.append({"role": "assistant", "content": text_acc or None, "tool_calls": tc_list})
-
+        # ── Execute each tool and feed result back ─────────────────────────
         for tc in tc_list:
             name = tc["function"]["name"]
             try:
@@ -341,46 +339,47 @@ async def respond(
 
             history.append({"role": "assistant", "content": f"{label}\n```{lang}\n{snippet}\n```\n*⏳ running…*"})
             tool_idx = len(history) - 1
-            yield history, session_id
+            yield history, session_id, llm_history
 
-            # Execute directly via sandbox executor to get the raw ExecutionResult
+            # Execute via sandbox
             result, new_files = await _run_tool(backend, session_id, name, args)
 
-            # Format the display output similar to the user's request
+            # Format UI output
             icon = "✅" if result.success else "❌"
             exit_code = result.exit_code if result.exit_code is not None else (0 if result.success else 1)
-
+            
             output = result.stdout or ""
             if result.stderr:
                 output = f"{output}\n{result.stderr}" if output else result.stderr
-
-            # If there's a result value (expression), include it
+            
             if result.result is not None and not result.stdout:
                 res_str = str(result.result)
                 output = f"{output}\n{res_str}" if output else res_str
-
+            
             if not output.strip():
                 output = "(no output)"
 
+            history = list(history)
             history[tool_idx]["content"] = f"{label}\n```{lang}\n{snippet}\n```\n{icon} exit={exit_code}\n```\n{output}\n```"
-            yield history, session_id
+            yield history, session_id, llm_history
 
+            # Show files in UI
             for f_path, f_bytes in new_files:
                 ext = Path(f_path).suffix.lower()
                 tmp = _save_tmp(f_bytes, suffix=ext)
                 history.append({"role": "assistant", "content": gr.FileData(path=tmp, orig_name=Path(f_path).name)})
-                yield history, session_id
+                yield history, session_id, llm_history
 
-            # For the LLM, we still feed it the combined text output
+            # Add to technical LLM history
             combined_text = result.stdout or ""
             if result.stderr:
                 combined_text = f"{combined_text}\n{result.stderr}" if combined_text else result.stderr
             if result.result is not None and not result.stdout:
                 combined_text = f"{combined_text}\n{result.result}" if combined_text else str(result.result)
 
-            llm_msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": combined_text})
+            llm_history.append({"role": "tool", "tool_call_id": tc["id"], "content": combined_text})
 
-    yield history, session_id
+    yield history, session_id, llm_history
 
 
 # ── Gradio UI ──────────────────────────────────────────────────────────────────
@@ -409,6 +408,7 @@ async def get_models_for_ui(p, k):
 
 with gr.Blocks(title="Mayflower Sandbox") as demo:
     session_id = gr.State()
+    llm_history = gr.State([])
     demo.load(fn=lambda: str(uuid.uuid4()), outputs=session_id)
 
     gr.Markdown("# 🧪 Mayflower Sandbox\nReal Python/Shell execution. Variables and files persist.")
@@ -434,11 +434,13 @@ with gr.Blocks(title="Mayflower Sandbox") as demo:
 
     provider_in.change(update_provider_settings, inputs=[provider_in], outputs=[api_url_in, api_key_in, badge_info, model_in])
     fetch_btn.click(get_models_for_ui, inputs=[provider_in, api_key_in], outputs=[model_in])
-
-    _inputs = [msg_input, chatbot, session_id, api_url_in, api_key_in, model_in]
-    msg_input.submit(respond, _inputs, [chatbot, session_id]).then(lambda: "", outputs=msg_input)
-    send_btn.click(respond, _inputs, [chatbot, session_id]).then(lambda: "", outputs=msg_input)
-    clear_btn.click(lambda: ([], str(uuid.uuid4())), outputs=[chatbot, session_id])
+    
+    _inputs = [msg_input, chatbot, session_id, api_url_in, api_key_in, model_in, llm_history]
+    _outputs = [chatbot, session_id, llm_history]
+    
+    msg_input.submit(respond, _inputs, _outputs).then(lambda: "", outputs=msg_input)
+    send_btn.click(respond, _inputs, _outputs).then(lambda: "", outputs=msg_input)
+    clear_btn.click(lambda: ([], str(uuid.uuid4()), []), outputs=[chatbot, session_id, llm_history])
 
 if __name__ == "__main__":
     demo.queue().launch(server_name="0.0.0.0", server_port=int(os.getenv("GRADIO_SERVER_PORT", "7860")), show_error=True, theme=gr.themes.Soft(), css=_CSS)
