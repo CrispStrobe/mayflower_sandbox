@@ -8,7 +8,7 @@
 [![Security: Bandit](https://img.shields.io/badge/security-bandit-yellow.svg)](https://bandit.readthedocs.io/)
 [![SBOM: CycloneDX](https://img.shields.io/badge/SBOM-CycloneDX-blue.svg)](https://cyclonedx.org/)
 
-Production-ready Python sandbox implementing the [DeepAgents](https://github.com/mayflower/deepagents) `SandboxBackendProtocol`, with persistent virtual filesystem and document processing helpers.
+Production-ready Python sandbox implementing the [DeepAgents](https://reference.langchain.com/python/deepagents/backends/protocol/SandboxBackendProtocol) `SandboxBackendProtocol`, with persistent virtual filesystem and document processing helpers.
 
 ## Key Features
 
@@ -48,6 +48,39 @@ backend = MayflowerSandboxBackend(
 
 result = await backend.aexecute("print('hello world')")
 ```
+
+## Interactive Gradio Demo
+
+Mayflower Sandbox includes a Gradio chatbot demo (`demo/app.py`) that showcases usage with various LLM providers.
+
+### Key Demo Features
+- **Multi-Provider Support** -- Scaleway, Mistral, OpenRouter, Groq, OpenAI, and local Ollama
+- **Automatic Tool-Calling** -- The LLM automatically decides when to use Python or Shell
+- **Dynamic File Display** -- Plots and generated files (CSV, PDF, etc.) are shown inline and are downloadable
+- **Conversation Persistence** -- Variables and files persist across turns within the same chat session
+- **Smart Model Fetching** -- Dynamic model list loading from provider APIs
+- **Memory Optimized** -- Robust handling of large data structures to prevent sandbox memory errors
+
+### Running the Demo
+
+1. **Configure Environment** -- Create a `.env` file in the project root with your API keys:
+   ```bash
+   MISTRAL_API_KEY=your_key
+   OPENROUTER_API_KEY=your_key
+   GROQ_API_KEY=your_key
+   # ... etc
+   ```
+
+2. **Install Dependencies**:
+   ```bash
+   pip install -e ".[demo]"
+   ```
+
+3. **Launch**:
+   ```bash
+   python demo/app.py
+   ```
+   The UI will be available at `http://localhost:7860`.
 
 ## Core Features
 
