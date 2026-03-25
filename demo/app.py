@@ -315,10 +315,10 @@ _EXAMPLES = [
 
 _CSS = """
 footer { display: none !important; }
-.contain { max-width: 1100px !important; }
 """
 
-with gr.Blocks(title="Mayflower Sandbox", css=_CSS, theme=gr.themes.Soft()) as demo:
+# Gradio 6: css/theme moved from Blocks() to launch()
+with gr.Blocks(title="Mayflower Sandbox") as demo:
     session_id = gr.State()
     demo.load(fn=lambda: str(uuid.uuid4()), outputs=session_id)
 
@@ -332,11 +332,10 @@ with gr.Blocks(title="Mayflower Sandbox", css=_CSS, theme=gr.themes.Soft()) as d
         # ── Chat column ───────────────────────────────────────────────────────
         with gr.Column(scale=4):
             chatbot = gr.Chatbot(
-                type="messages",
                 height=560,
                 show_label=False,
                 render_markdown=True,
-                bubble_full_width=False,
+                layout="bubble",
             )
             with gr.Row():
                 msg_input = gr.Textbox(
@@ -389,4 +388,6 @@ if __name__ == "__main__":
         server_name="0.0.0.0",
         server_port=int(os.getenv("GRADIO_SERVER_PORT", "7860")),
         show_error=True,
+        theme=gr.themes.Soft(),
+        css=_CSS,
     )
