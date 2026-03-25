@@ -54,10 +54,10 @@ class PyodideWorker:
         return data[: newline_pos + 1]
 
     async def _read_large_line(self, reader: asyncio.StreamReader) -> bytes:
-        """Read a line with support for large responses (up to 10MB)."""
+        """Read a line with support for large responses (up to 50MB)."""
         chunks = []
         total_size = 0
-        max_size = 10 * 1024 * 1024  # 10MB
+        max_size = 50 * 1024 * 1024  # 50MB
 
         # Use leftover data from a previous read
         if self._read_buffer:

@@ -257,25 +257,25 @@ class PostgresBackend(BackendProtocol):
                 subdirs.add(prefix + subdir_name + "/")
                 continue
             infos.append(
-                {
-                    "path": file_path,
-                    "is_dir": False,
-                    "size": int(file_row.get("size", 0) or 0),
-                    "modified_at": _format_timestamp(file_row.get("modified_at")),
-                }
+                FileInfo(
+                    path=file_path,
+                    is_dir=False,
+                    size=int(file_row.get("size", 0) or 0),
+                    modified_at=_format_timestamp(file_row.get("modified_at")),
+                )
             )
 
         for subdir in sorted(subdirs):
             infos.append(
-                {
-                    "path": subdir,
-                    "is_dir": True,
-                    "size": 0,
-                    "modified_at": "",
-                }
+                FileInfo(
+                    path=subdir,
+                    is_dir=True,
+                    size=0,
+                    modified_at="",
+                )
             )
 
-        infos.sort(key=lambda item: item.get("path", ""))
+        infos.sort(key=lambda item: getattr(item, "path", ""))
         return infos
 
     # -------------------------------------------------------------------------
@@ -1040,7 +1040,8 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
             code = command[len(shell_sentinel) :]
             logger.info("Forcing shell execution via sentinel")
             result = await self._executor.execute_shell(code)
-            return self._format_shell_result(result)
+            return await self._aformat_shell_result(result)
+
 
         # Handle __PYTHON__ sentinel
         sentinel_prefix = f"{self._PYTHON_SENTINEL}\n"
@@ -1080,7 +1081,7 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
             return await self._aexecute_python_code(command)
 
         result = await self._executor.execute_shell(command)
-        return self._format_shell_result(result)
+        return await self._aformat_shell_result(result)
 
     def _format_shell_result(self, result: ExecutionResult) -> ExecuteResponse:
         """Helper to format SandboxExecutor shell result into ExecuteResponse."""
@@ -1093,5 +1094,25 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
             exit_code = result.exit_code
         else:
             exit_code = 0 if result.success else 1
+
+        # Store pending files for shell commands too
+        self._store_pending_files(result)
+
+        return ExecuteResponse(output=output, exit_code=exit_code, truncated=False)
+
+    async def _aformat_shell_result(self, result: ExecutionResult) -> ExecuteResponse:
+        """Async helper to format SandboxExecutor shell result into ExecuteResponse."""
+        output = result.stdout or ""
+        if result.stderr:
+            output = f"{output}\n{result.stderr}" if output else result.stderr
+
+        exit_code: int = 0
+        if result.exit_code is not None:
+            exit_code = result.exit_code
+        else:
+            exit_code = 0 if result.success else 1
+
+        # Store pending files for shell commands too
+        await self._astore_pending_files(result)
 
         return ExecuteResponse(output=output, exit_code=exit_code, truncated=False)

@@ -112,9 +112,36 @@ except ImportError:
   pyodide.setStdout(createStdoutHandler(stdoutBuffer, stdoutDecoder));
 
   await pyodide.runPythonAsync(`
+import micropip
+
 _session_bytes = bytes(${JSON.stringify(Array.from(sessionBytes))})
-_session_obj = cloudpickle.loads(_session_bytes)
+
+# Pre-install common modules often found in pickled sessions
+for _m in ['numpy', 'matplotlib', 'pandas']:
+    try:
+        import importlib
+        importlib.import_module(_m)
+    except ImportError:
+        await micropip.install(_m)
+
+# Attempt to load the session, installing missing modules as needed
+for _retry in range(5):  # hard cap on recursive dependency resolution
+    try:
+        _session_obj = cloudpickle.loads(_session_bytes)
+        break
+    except (ModuleNotFoundError, Exception) as e:
+        if hasattr(e, 'name') and e.name:
+            _pkg = e.name.split('.')[0]
+            await micropip.install(_pkg)
+        else:
+            raise
+
 globals().update(_session_obj)
+
+# Cleanup helper vars safely
+for _v in ['_session_bytes', '_session_obj', '_retry', '_pkg', '_m', 'importlib']:
+    globals().pop(_v, None)
+del _v
 `);
 }
 
@@ -161,18 +188,23 @@ importlib.invalidate_caches()
 }
 
 /**
- * Configure matplotlib backend for non-browser environments
+ * Configure matplotlib and pre-install common packages
  */
 async function configureEnvironment(pyodide: any): Promise<void> {
   try {
     await pyodide.runPythonAsync(`
 import os
 import sys
-if 'matplotlib' not in sys.modules:
-    os.environ['MPLBACKEND'] = 'Agg'
+import micropip
+
+# Configure matplotlib for non-interactive backend
+os.environ['MPLBACKEND'] = 'Agg'
+
+# Pre-install common modules
+await micropip.install(['numpy', 'matplotlib', 'pandas'])
 `);
   } catch {
-    // matplotlib config failed - not critical, continue anyway
+    // environment config failed - not critical, continue anyway
   }
 }
 
@@ -266,7 +298,7 @@ except ImportError:
     // Return full file list for deletion detection
     if (options.stateful) {
       const { snapshotFiles } = await import("./fs_utils.ts");
-      const finalSnapshot = snapshotFiles(pyodide, ["/tmp", "/home"]);
+      const finalSnapshot = snapshotFiles(pyodide, ["/tmp", "/home", "/site-packages"]);
       const finalFilesRecord: Record<string, number[]> = {};
       const collected = collectFilesFromPaths(pyodide, Array.from(finalSnapshot.keys()));
       for (const fileObj of collected) {

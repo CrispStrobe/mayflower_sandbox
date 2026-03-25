@@ -809,9 +809,12 @@ class SandboxExecutor:
                 # Only perform deletion if we actually got a final file list to compare against
                 if final_worker_files:
                     for old_file in before_vfs_files:
-                        # CRITICAL: Only delete if the file is in /tmp or /home
-                        # Other files (like root project files) are not tracked by worker
-                        is_tracked_path = old_file.startswith("/tmp") or old_file.startswith("/home")  # noqa: S108  # nosec B108  # fmt: skip
+                        # Track /tmp, /home AND /site-packages for persistence
+                        is_tracked_path = (
+                            old_file.startswith("/tmp")
+                            or old_file.startswith("/home")
+                            or old_file.startswith("/site-packages")
+                        )
 
                         if (
                             is_tracked_path
@@ -958,7 +961,11 @@ class SandboxExecutor:
 
             if final_worker_files:
                 for old_file in before_vfs_files:
-                    is_tracked_path = old_file.startswith("/tmp") or old_file.startswith("/home")  # noqa: S108  # nosec B108  # fmt: skip
+                    is_tracked_path = (
+                        old_file.startswith("/tmp")
+                        or old_file.startswith("/home")
+                        or old_file.startswith("/site-packages")
+                    )
                     if (
                         is_tracked_path
                         and old_file not in final_worker_files

@@ -96,8 +96,8 @@ export function isSystemPath(path: string): boolean {
     path.startsWith("/proc") ||
     path.startsWith("/dev") ||
     path.startsWith("/etc") ||
-    path.startsWith("/usr") ||
-    path.startsWith("/site-packages")
+    path.startsWith("/usr")
+    // /site-packages is explicitly NOT a system path now so it persists
   );
 }
 

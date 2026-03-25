@@ -1,46 +1,102 @@
-"""
-Mayflower Sandbox — Gradio Demo
-An LLM chatbot with real Python/shell execution via the Mayflower sandbox.
-
-Local usage:
-    pip install -e ".[demo]"
-    python demo/app.py
-
-Docker / HF Spaces:
-    docker build -f demo/Dockerfile -t mayflower-demo .
-    docker run -p 7860:7860 -e API_KEY=sk-... mayflower-demo
-"""
-
-from __future__ import annotations
-
 import asyncio
 import json
 import os
 import tempfile
 import uuid
+import logging
+import sys
 from pathlib import Path
+from typing import Any, cast
 
 import gradio as gr
+import httpx
+from dotenv import load_dotenv
 from openai import AsyncOpenAI
+
+# ── Load environment variables ────────────────────────────────────────────────
+load_dotenv()
+
+# ── Logging setup ──────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    stream=sys.stderr,
+)
+logger = logging.getLogger("mayflower_demo")
 
 # ── Sandbox setup ──────────────────────────────────────────────────────────────
 os.environ.setdefault("MAYFLOWER_USE_SQLITE", "true")
 
-from mayflower_sandbox.db import create_sqlite_pool  # noqa: E402
-from mayflower_sandbox.deepagents_backend import MayflowerSandboxBackend  # noqa: E402
+from mayflower_sandbox.db import create_sqlite_pool  # type: ignore # noqa: E402
+from mayflower_sandbox.deepagents_backend import (  # type: ignore # noqa: E402
+    MayflowerSandboxBackend,
+)
 
-_DB_PATH = os.getenv("MAYFLOWER_DB_PATH", "/tmp/mayflower_demo.db")
-_pool: object | None = None
+_DB_PATH = os.getenv("MAYFLOWER_DB_PATH", "/tmp/mayflower_demo.db")  # nosec B108
+_pool: Any = None
 _pool_lock = asyncio.Lock()
 
 
-async def _get_pool() -> object:
+async def _get_pool() -> Any:
     global _pool
     if _pool is None:
         async with _pool_lock:
             if _pool is None:
                 _pool = await create_sqlite_pool(_DB_PATH)
     return _pool
+
+
+try:
+    from config import DEFAULT_CHAT_MODEL, DEFAULT_CHAT_PROVIDER, PROVIDERS as CONFIG_PROVIDERS
+except ImportError:
+    try:
+        from demo.config import DEFAULT_CHAT_MODEL, DEFAULT_CHAT_PROVIDER, PROVIDERS as CONFIG_PROVIDERS
+    except ImportError:
+        from .config import DEFAULT_CHAT_MODEL, DEFAULT_CHAT_PROVIDER, PROVIDERS as CONFIG_PROVIDERS
+
+# ── Providers and Models ─────────────────────────────────────────────────────
+# Merge CONFIG_PROVIDERS and ensure Ollama is present as a fallback
+PROVIDERS: dict[str, dict[str, Any]] = cast("dict[str, dict[str, Any]]", CONFIG_PROVIDERS.copy())
+if "Ollama" not in PROVIDERS:
+    PROVIDERS["Ollama"] = {
+        "base_url": "http://localhost:11434/v1",
+        "key_name": "OLLAMA",
+        "chat_models": ["llama3.2:3b", "llama3.1:8b"],
+        "badge": "🏠 <b>Local</b>",
+    }
+
+
+async def fetch_models(provider_name: str, api_key: str | None) -> list[str]:
+    """Fetch models from the selected provider's /models endpoint."""
+    config = PROVIDERS.get(provider_name)
+    if not config:
+        return []
+
+    # Use base_url from config
+    url = config["base_url"].rstrip("/") + "/models"
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, headers=headers, timeout=10.0)
+            response.raise_for_status()
+            data = response.json()
+
+        models = []
+        # Standard OpenAI-compatible /models response format
+        for item in data.get("data", []):
+            model_id = item.get("id")
+            if not model_id:
+                continue
+            models.append(model_id)
+
+        return sorted(models)
+    except Exception as e:
+        logger.error(f"Error fetching models for {provider_name}: {e}")
+        # Fallback to predefined models in config if fetch fails
+        return config.get("chat_models", []) or config.get("vision_models", [])
 
 
 # ── Tool definitions (OpenAI function-calling format) ─────────────────────────
@@ -86,19 +142,27 @@ TOOLS = [
 
 SYSTEM_PROMPT = """You are a helpful AI assistant with direct access to a Python sandbox and a shell.
 
-Capabilities:
-- run_python: stateful Python execution. Variables persist between calls in the same session.
-  Install packages: `import micropip; await micropip.install(['numpy', 'matplotlib'])`
-  For plots: always call `matplotlib.use('Agg')` first, then `plt.savefig('/home/plot.png')`.
-  Images saved to /home/ are shown automatically — no need to display them manually.
-- shell: BusyBox shell (ls, cat, grep, wc, echo, mkdir, rm, sed, awk, pipes, &&).
+Python Sandbox Rules:
+1. Persistence: Variables AND files (/home, /tmp, /site-packages) persist between calls and conversation turns in the same session.
+2. Packages: Most common packages (numpy, matplotlib, pandas) are pre-installed.
+   If you need others, you MUST use `import micropip; await micropip.install('package_name')`.
+   IMPORTANT: You MUST `await` the install call.
+3. Plotting: Always use `matplotlib.use('Agg')` BEFORE importing `plt`.
+   Save plots to `/home/plot.png`. Images saved in `/home` are automatically shown to the user.
+4. Shell: You have a BusyBox shell. Use it for file management or system tasks.
+5. Files: You can create a file in one turn and read it in the next.
 
-Style: Be direct. When asked to compute or visualise something, do it immediately with the tools.
+Style: Be direct. Execute code immediately when asked.
 Do not ask clarifying questions when the intent is clear."""
 
 # ── Execution helpers ──────────────────────────────────────────────────────────
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
-_seen_images: dict[str, set[str]] = {}  # session_id → paths already shown
+_DOWNLOAD_EXTS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp",
+    ".pdf", ".csv", ".docx", ".xlsx", ".pptx", ".txt", ".json", ".md"
+}
+# session_id → path → last_seen_mtime
+_last_mtimes: dict[str, dict[str, str]] = {}
 
 
 async def _run_tool(
@@ -108,6 +172,8 @@ async def _run_tool(
     args: dict,
 ) -> tuple[str, list[tuple[str, bytes]]]:
     """Execute one tool call. Returns (output_text, [(path, bytes), ...])."""
+    logger.info(f"Tool execution: {name}({json.dumps(args)})")
+    
     if name == "run_python":
         result = await backend.aexecute(args.get("code", ""))
     elif name == "shell":
@@ -120,25 +186,46 @@ async def _run_tool(
     if result.truncated:
         text += "\n… (output truncated)"
 
-    # Collect new image files from /home/ (only ones not yet shown)
-    seen = _seen_images.setdefault(session_id, set())
-    new_images: list[tuple[str, bytes]] = []
+    # Collect files from /home/ that are new or updated
+    last_seen = _last_mtimes.setdefault(session_id, {})
+    new_files: list[tuple[str, bytes]] = []
     try:
         vfs_files = await backend.als_info("/home")
-        img_paths = [
-            f.path
-            for f in vfs_files
-            if not f.is_dir and Path(f.path).suffix.lower() in _IMAGE_EXTS and f.path not in seen
-        ]
-        if img_paths:
-            for dl in await backend.adownload_files(img_paths):
-                if dl.content:
-                    seen.add(dl.path)
-                    new_images.append((dl.path, dl.content))
-    except Exception:  # noqa: S110  # nosec B110 — VFS scan is best-effort
-        pass
+        target_paths = []
+        logger.info(f"Scanning /home for session {session_id}. Found {len(vfs_files)} entries.")
+        
+        for f in vfs_files:
+            # Handle both object (FileInfo) and dict formats robustly
+            is_dir = f.is_dir if hasattr(f, "is_dir") else f.get("is_dir", False)
+            path = f.path if hasattr(f, "path") else f.get("path", "")
+            modified_at = f.modified_at if hasattr(f, "modified_at") else f.get("modified_at", "")
 
-    return text, new_images
+            if is_dir:
+                continue
+            suffix = Path(path).suffix.lower()
+            if suffix not in _DOWNLOAD_EXTS:
+                continue
+
+            # Show if never seen before, or if modified since last seen
+            if path not in last_seen or modified_at != last_seen[path]:
+                logger.info(f"New/updated file detected: {path} (mtime: {modified_at})")
+                target_paths.append(path)
+                last_seen[path] = modified_at
+            else:
+                logger.debug(f"Skipping unchanged file: {f.path}")
+
+        if target_paths:
+            logger.info(f"Downloading {len(target_paths)} files: {target_paths}")
+            for dl in await backend.adownload_files(target_paths):
+                if dl.content:
+                    logger.info(f"Successfully downloaded {dl.path} ({len(dl.content)} bytes)")
+                    new_files.append((dl.path, dl.content))
+                else:
+                    logger.warning(f"File {dl.path} had empty content on download.")
+    except Exception as e:
+        logger.exception(f"Error during VFS scan/download: {e}")
+
+    return text, new_files
 
 
 def _save_tmp(data: bytes, suffix: str = ".png") -> str:
@@ -151,7 +238,7 @@ def _save_tmp(data: bytes, suffix: str = ".png") -> str:
 # ── Main chat coroutine ────────────────────────────────────────────────────────
 async def respond(
     user_msg: str,
-    history: list[dict],
+    history: list[dict[str, Any]],
     session_id: str,
     api_url: str,
     api_key: str,
@@ -161,6 +248,8 @@ async def respond(
     if not user_msg.strip():
         yield history, session_id
         return
+
+    logger.info(f"New user message: {user_msg} (session: {session_id}, model: {model})")
 
     pool = await _get_pool()
     backend = MayflowerSandboxBackend(
@@ -175,10 +264,10 @@ async def respond(
         api_key=api_key or "ollama",
     )
 
-    # Build LLM context from history (text only — images are display-only)
+    # Build LLM context from history (dict format)
     llm_msgs: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
     for m in history:
-        if m["role"] in ("user", "assistant") and isinstance(m.get("content"), str):
+        if isinstance(m.get("content"), str):
             llm_msgs.append({"role": m["role"], "content": m["content"]})
     llm_msgs.append({"role": "user", "content": user_msg})
 
@@ -191,17 +280,20 @@ async def respond(
         tc_acc: dict[int, dict] = {}
         stream_msg_idx: int | None = None
 
+        logger.info(f"Starting LLM iteration {_iteration}")
         try:
             stream = await client.chat.completions.create(
                 model=model,
-                messages=llm_msgs,
-                tools=TOOLS,
+                messages=llm_msgs,  # type: ignore
+                tools=cast("Any", TOOLS),
                 tool_choice="auto",
                 stream=True,
                 max_tokens=4096,
             )
         except Exception as exc:
-            history = history + [{"role": "assistant", "content": f"❌ **API error:** {exc}"}]
+            logger.error(f"OpenAI API error: {exc}")
+            history = list(history)
+            history.append({"role": "assistant", "content": f"❌ **API error:** {exc}"})
             yield history, session_id
             return
 
@@ -210,44 +302,41 @@ async def respond(
                 continue
             delta = chunk.choices[0].delta
 
-            # Accumulate streamed text and update the last assistant bubble
             if delta.content:
                 text_acc += delta.content
+                history = list(history)
                 if stream_msg_idx is None:
-                    history = history + [{"role": "assistant", "content": text_acc}]
+                    history.append({"role": "assistant", "content": text_acc})
                     stream_msg_idx = len(history) - 1
                 else:
-                    history = list(history)
-                    history[stream_msg_idx] = {"role": "assistant", "content": text_acc}
+                    history[stream_msg_idx]["content"] = text_acc
                 yield history, session_id
 
-            # Accumulate tool call chunks (may arrive across many chunks)
             if delta.tool_calls:
                 for tc in delta.tool_calls:
                     i = tc.index
                     if i not in tc_acc:
                         tc_acc[i] = {"id": "", "name": "", "arguments": ""}
                     if tc.id:
-                        tc_acc[i]["id"] = tc.id
+                        tc_acc[i]["id"] += tc.id
                     if tc.function:
                         if tc.function.name:
                             tc_acc[i]["name"] += tc.function.name
                         if tc.function.arguments:
                             tc_acc[i]["arguments"] += tc.function.arguments
 
-        # Commit text turn to LLM context
         if text_acc:
             llm_msgs.append({"role": "assistant", "content": text_acc})
 
-        # No tool calls → LLM is done
         if not tc_acc:
+            logger.info("LLM finished response (no tool calls).")
             break
 
         # ── Build the assistant tool-call message ──────────────────────────
         tc_list = []
         for i in sorted(tc_acc):
             tc = tc_acc[i]
-            if not tc["id"]:  # some models omit IDs
+            if not tc["id"]:
                 tc["id"] = f"call_{i}_{uuid.uuid4().hex[:8]}"
             tc_list.append(
                 {
@@ -270,39 +359,40 @@ async def respond(
             lang = "python" if name == "run_python" else "bash"
             label = "🐍 Python" if name == "run_python" else "🐚 Shell"
 
-            # Show "running…" placeholder
             pending = f"{label}\n```{lang}\n{snippet}\n```\n*⏳ running…*"
-            history = history + [{"role": "assistant", "content": pending}]
+            history = list(history)
+            history.append({"role": "assistant", "content": pending})
             tool_idx = len(history) - 1
             yield history, session_id
 
-            # Execute in sandbox
-            output_text, new_images = await _run_tool(backend, session_id, name, args)
+            output_text, new_files = await _run_tool(backend, session_id, name, args)
 
-            # Replace placeholder with result
             history = list(history)
-            history[tool_idx] = {
-                "role": "assistant",
-                "content": f"{label}\n```{lang}\n{snippet}\n```\n```\n{output_text}\n```",
-            }
+            history[tool_idx]["content"] = f"{label}\n```{lang}\n{snippet}\n```\n```\n{output_text}\n```"
             yield history, session_id
 
-            # Append any new images as separate bubbles
-            for img_path, img_bytes in new_images:
-                tmp = _save_tmp(img_bytes, suffix=Path(img_path).suffix)
-                history = history + [{"role": "assistant", "content": {"path": tmp}}]
+            if new_files:
+                logger.info(f"Adding {len(new_files)} new files to chat history.")
+            for file_path, file_bytes in new_files:
+                ext = Path(file_path).suffix.lower()
+                tmp = _save_tmp(file_bytes, suffix=ext)
+                filename = Path(file_path).name
+                logger.info(f"Appeding FileData for {filename} (tmp path: {tmp})")
+                history = list(history)
+                history.append({"role": "assistant", "content": gr.FileData(path=tmp, orig_name=filename)})
                 yield history, session_id
 
-            # Return tool result to LLM
             llm_msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": output_text})
 
     yield history, session_id
 
 
 # ── Gradio UI ──────────────────────────────────────────────────────────────────
-_DEFAULT_API_URL = os.getenv("API_URL", "http://localhost:11434/v1")
-_DEFAULT_API_KEY = os.getenv("API_KEY", os.getenv("OPENAI_API_KEY", "ollama"))
-_DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "llama3.2:3b")
+_DEFAULT_PROVIDER = DEFAULT_CHAT_PROVIDER
+_DEFAULT_CONFIG = PROVIDERS.get(_DEFAULT_PROVIDER, PROVIDERS["Ollama"])
+_DEFAULT_API_URL = _DEFAULT_CONFIG["base_url"]
+_DEFAULT_API_KEY = os.getenv(_DEFAULT_CONFIG["key_name"] + "_API_KEY", "") if _DEFAULT_CONFIG.get("key_name") else ""
+_DEFAULT_MODEL = DEFAULT_CHAT_MODEL
 
 _EXAMPLES = [
     "Plot a sine wave with random noise added. Save to /home/plot.png.",
@@ -316,6 +406,25 @@ _EXAMPLES = [
 _CSS = """
 footer { display: none !important; }
 """
+
+
+def update_provider_settings(provider_name):
+    config = PROVIDERS.get(provider_name, PROVIDERS["Ollama"])
+    url = config["base_url"]
+    key = os.getenv(config["key_name"] + "_API_KEY", "") if config.get("key_name") else ""
+    badge = config.get("badge", "")
+    # Update model dropdown choices based on config
+    models = config.get("chat_models", []) or config.get("vision_models", [])
+    model_val = models[0] if models else None
+    return url, key, badge, gr.Dropdown(choices=models, value=model_val)
+
+
+async def get_models_for_ui(provider_name, api_key):
+    models = await fetch_models(provider_name, api_key)
+    if not models:
+        return gr.Dropdown(choices=[], value=None, label="Model (No models found)")
+    return gr.Dropdown(choices=models, value=models[0] if models else None, label="Model")
+
 
 # Gradio 6: css/theme moved from Blocks() to launch()
 with gr.Blocks(title="Mayflower Sandbox") as demo:
@@ -351,24 +460,44 @@ with gr.Blocks(title="Mayflower Sandbox") as demo:
         # ── Config column ─────────────────────────────────────────────────────
         with gr.Column(scale=1, min_width=230):
             gr.Markdown("### ⚙️ LLM")
+            provider_in = gr.Dropdown(
+                choices=list(PROVIDERS.keys()),
+                value=_DEFAULT_PROVIDER,
+                label="Provider",
+            )
+            badge_info = gr.HTML(value=_DEFAULT_CONFIG.get("badge", ""))
+
             api_url_in = gr.Textbox(label="API URL", value=_DEFAULT_API_URL)
             api_key_in = gr.Textbox(label="API Key", value=_DEFAULT_API_KEY, type="password")
-            model_in = gr.Textbox(label="Model", value=_DEFAULT_MODEL)
+
+            with gr.Row():
+                fetch_btn = gr.Button("🔄 Fetch Models", size="sm")
+
+            model_in = gr.Dropdown(
+                choices=_DEFAULT_CONFIG.get("chat_models", [_DEFAULT_MODEL]),
+                value=_DEFAULT_MODEL,
+                label="Model",
+                allow_custom_value=True,
+            )
+
             gr.Markdown(
                 "---\n"
-                "**Local Ollama**\n"
-                "URL: `http://localhost:11434/v1`\n"
-                "Model: `llama3.2:3b`\n\n"
-                "**OpenAI**\n"
-                "URL: `https://api.openai.com/v1`\n"
-                "Model: `gpt-4o-mini`\n\n"
-                "**HF Inference**\n"
-                "URL: `https://api-inference.huggingface.co/v1`\n"
-                "Model: `Qwen/Qwen2.5-72B-Instruct`\n\n"
                 "⚠️ Model must support **tool/function calling**."
             )
 
     # ── Event handlers ─────────────────────────────────────────────────────────
+    provider_in.change(
+        update_provider_settings,
+        inputs=[provider_in],
+        outputs=[api_url_in, api_key_in, badge_info, model_in],
+    )
+
+    fetch_btn.click(
+        get_models_for_ui,
+        inputs=[provider_in, api_key_in],
+        outputs=[model_in],
+    )
+
     _inputs = [msg_input, chatbot, session_id, api_url_in, api_key_in, model_in]
     _outputs = [chatbot, session_id]
 
@@ -377,7 +506,7 @@ with gr.Blocks(title="Mayflower Sandbox") as demo:
 
     def _new_session():
         new_id = str(uuid.uuid4())
-        _seen_images.pop(new_id, None)
+        _last_mtimes.pop(new_id, None)
         return [], new_id
 
     clear_btn.click(_new_session, outputs=[chatbot, session_id])
@@ -385,7 +514,7 @@ with gr.Blocks(title="Mayflower Sandbox") as demo:
 
 if __name__ == "__main__":
     demo.queue().launch(
-        server_name="0.0.0.0",
+        server_name="0.0.0.0",  # nosec B104
         server_port=int(os.getenv("GRADIO_SERVER_PORT", "7860")),
         show_error=True,
         theme=gr.themes.Soft(),

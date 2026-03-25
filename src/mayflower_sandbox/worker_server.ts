@@ -89,16 +89,46 @@ except ImportError:
 `);
 
   await pyodide.runPythonAsync(`
+import json
+import micropip
+
 _session_bytes = bytes(${JSON.stringify(Array.from(sessionBytes))})
-_session_obj = cloudpickle.loads(_session_bytes)
+
+# Pre-install common modules often found in pickled sessions to avoid errors
+# during cloudpickle.loads before we can even catch the exception.
+for _m in ['numpy', 'matplotlib', 'pandas']:
+    try:
+        import importlib
+        importlib.import_module(_m)
+    except ImportError:
+        await micropip.install(_m)
+
+# Attempt to load the session, installing missing modules as needed
+for _retry in range(5):  # hard cap on recursive dependency resolution
+    try:
+        _session_obj = cloudpickle.loads(_session_bytes)
+        break
+    except (ModuleNotFoundError, Exception) as e:
+        # If it's a ModuleNotFoundError, try to install the missing package
+        if hasattr(e, 'name') and e.name:
+            _pkg = e.name.split('.')[0]
+            await micropip.install(_pkg)
+        else:
+            # For other errors or if package name is missing, we stop
+            raise
+
 # Clear all user-defined names before applying session to prevent state
 # from a previous thread's execution leaking into this session.
-_skip = frozenset({'_session_bytes', '_session_obj', '_skip', 'cloudpickle', 'micropip'})
+_skip = frozenset({'_session_bytes', '_session_obj', '_skip', 'cloudpickle', 'micropip', 'json', 'importlib'})
 for _k in [k for k in list(globals()) if not k.startswith('__') and k not in _skip]:
     del globals()[_k]
 globals().pop('_k', None)
 globals().update(_session_obj)
-del _session_bytes, _session_obj, _skip
+
+# Cleanup helper vars safely
+for _v in ['_session_bytes', '_session_obj', '_skip', '_retry', '_pkg', '_m']:
+    globals().pop(_v, None)
+del _v
 `);
 }
 
@@ -279,8 +309,14 @@ class PyodideWorker {
     await this.pyodide.runPythonAsync(`
 import os
 import sys
-if 'matplotlib' not in sys.modules:
-    os.environ['MPLBACKEND'] = 'Agg'
+import micropip
+
+# Configure matplotlib for non-interactive backend
+os.environ['MPLBACKEND'] = 'Agg'
+
+# Pre-install common heavy modules to speed up first execution
+# These are handled by micropip which uses the database cache if available
+await micropip.install(['numpy', 'matplotlib', 'pandas'])
 `);
 
     this.initialized = true;
@@ -320,7 +356,7 @@ if 'matplotlib' not in sys.modules:
 
       // Set up file tracking
       const tracker = createFileTracker();
-      const beforeSnapshot = snapshotFiles(this.pyodide, ["/tmp", "/home"]);
+      const beforeSnapshot = snapshotFiles(this.pyodide, ["/tmp", "/home", "/site-packages"]);
       this.pyodide.FS.trackingDelegate = tracker.delegate;
 
       // Execute code
@@ -349,7 +385,7 @@ if 'matplotlib' not in sys.modules:
 
       // Return full file list for deletion detection
       if (params.stateful) {
-        const finalSnapshot = snapshotFiles(this.pyodide, ["/tmp", "/home"]);
+        const finalSnapshot = snapshotFiles(this.pyodide, ["/tmp", "/home", "/site-packages"]);
         const finalFilesRecord: Record<string, number[]> = {};
         const collected = collectFilesFromPaths(this.pyodide, Array.from(finalSnapshot.keys()));
         for (const fileObj of collected) {
