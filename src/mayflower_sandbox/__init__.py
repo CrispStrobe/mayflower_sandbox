@@ -6,8 +6,9 @@ from .db import create_sqlite_pool
 from .filesystem import VirtualFilesystem
 from .manager import SandboxManager
 from .sandbox_executor import SandboxExecutor
+from .sync_manager import SyncSandboxManager
 
-__all__ = ["SandboxManager", "VirtualFilesystem", "SandboxExecutor", "create_sqlite_pool"]
+__all__ = ["SandboxManager", "SyncSandboxManager", "VirtualFilesystem", "SandboxExecutor", "create_sqlite_pool"]
 
 PostgresBackend: Any | None
 MayflowerSandboxBackend: Any | None

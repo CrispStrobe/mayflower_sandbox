@@ -498,15 +498,15 @@ class PostgresBackend(BackendProtocol):
             if not fnmatch.fnmatch(rel, pattern):
                 continue
             infos.append(
-                {
-                    "path": file_path,
-                    "is_dir": False,
-                    "size": int(file_row.get("size", 0) or 0),
-                    "modified_at": _format_timestamp(file_row.get("modified_at")),
-                }
+                FileInfo(
+                    path=file_path,
+                    is_dir=False,
+                    size=int(file_row.get("size", 0) or 0),
+                    modified_at=_format_timestamp(file_row.get("modified_at")),
+                )
             )
 
-        infos.sort(key=lambda item: item.get("path", ""))
+        infos.sort(key=lambda item: getattr(item, "path", ""))
         return infos
 
     # -------------------------------------------------------------------------

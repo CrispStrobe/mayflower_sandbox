@@ -76,7 +76,7 @@ class PyodideWorker:
             total_size += len(chunk)
 
             if total_size > max_size:
-                raise RuntimeError("Response exceeded 10MB limit")
+                raise RuntimeError("Response exceeded 50MB limit")
 
             if b"\n" in chunk:
                 return self._split_at_newline(b"".join(chunks))

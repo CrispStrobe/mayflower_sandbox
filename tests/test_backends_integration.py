@@ -161,7 +161,7 @@ class TestPostgresBackendIntegration:
 
         # Glob for .py files
         infos = await backend.aglob_info("*.py", "/src")
-        paths = [info["path"] for info in infos]
+        paths = [info.path for info in infos]
 
         assert "/src/main.py" in paths
         assert "/src/test.py" in paths
