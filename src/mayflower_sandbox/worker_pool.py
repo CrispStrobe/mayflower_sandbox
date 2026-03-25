@@ -93,11 +93,13 @@ class PyodideWorker:
         cmd = [
             "deno",
             "run",
-            "--allow-net" if self.allow_all_net else f"--allow-net={','.join(sorted(self.allowed_hosts))}",
+            "--allow-net"
+            if self.allow_all_net
+            else f"--allow-net={','.join(sorted(self.allowed_hosts))}",
             "--allow-read",
             "--allow-write",
         ]
-        
+
         if self.enable_debugger:
             # Random port to avoid conflicts in pool
             cmd.append("--inspect")
@@ -337,7 +339,8 @@ class WorkerPool:
                 self._allowed_hosts,
                 enable_debugger=self.enable_debugger,
                 allow_all_net=self.allow_all_net,
-            ) for i in range(self.size)
+            )
+            for i in range(self.size)
         ]
 
         # Start workers in parallel

@@ -18,9 +18,14 @@ from typing import TYPE_CHECKING, Any
 try:
     import asyncpg
 except ImportError:
+
     class _DummyAsyncpg:
-        class UndefinedTableError(Exception): pass
-        class UndefinedColumnError(Exception): pass
+        class UndefinedTableError(Exception):
+            pass
+
+        class UndefinedColumnError(Exception):
+            pass
+
     asyncpg = _DummyAsyncpg()  # type: ignore
 
 from .bootstrap import write_bootstrap_files
@@ -120,7 +125,9 @@ class SandboxExecutor:
         self._helpers_loaded = False
 
     @classmethod
-    async def _ensure_mcp_bridge(cls, db_pool: Any, thread_id: str, stateful: bool = False) -> int | None:
+    async def _ensure_mcp_bridge(
+        cls, db_pool: Any, thread_id: str, stateful: bool = False
+    ) -> int | None:
         """
         Ensure MCP bridge is started (lazy initialization).
 
@@ -177,7 +184,9 @@ class SandboxExecutor:
                         # Debugger requires predictable worker mapping
                         pool_size = 1
 
-                    logger.info(f"Initializing Pyodide worker pool (size={pool_size}, debugger={enable_debugger}, allow_all_net={allow_all_net}, extra_hosts={extra_hosts})...")
+                    logger.info(
+                        f"Initializing Pyodide worker pool (size={pool_size}, debugger={enable_debugger}, allow_all_net={allow_all_net}, extra_hosts={extra_hosts})..."
+                    )
 
                     pool = WorkerPool(
                         size=pool_size,
@@ -257,7 +266,7 @@ class SandboxExecutor:
                     allowed_hosts.add(host)
         if mcp_bridge_port is not None:
             allowed_hosts.add(f"127.0.0.1:{mcp_bridge_port}")
-            
+
         if isinstance(self.allow_net, list):
             for host in self.allow_net:
                 allowed_hosts.add(host)
@@ -288,7 +297,7 @@ class SandboxExecutor:
 
     def _build_shell_command(self, command: str) -> list[str]:
         """Build Deno command for shell execution."""
-        
+
         # Determine network permissions for shell
         net_flag = ""
         if isinstance(self.allow_net, list):
@@ -298,17 +307,17 @@ class SandboxExecutor:
             net_flag = f"--allow-net={','.join(self.allow_net)}"
         elif self.allow_net is True:
             net_flag = "--allow-net"
-            
+
         cmd: list[str] = [
             "deno",
             "run",
             "--allow-read",
             "--allow-write",
         ]
-        
+
         if net_flag:
             cmd.append(net_flag)
-            
+
         if config_path := self._get_deno_config_path():
             cmd.extend(["--config", str(config_path)])
         cmd.extend(
@@ -585,13 +594,15 @@ class SandboxExecutor:
             "builtins.__MCP_CALL__ = __MCP_CALL__\n"
             "\n"
             "async def eval_ts(code):\n"
-            "    \"\"\"Evaluate TypeScript code via Deno bridge (Feature 8).\"\"\"\n"
+            '    """Evaluate TypeScript code via Deno bridge (Feature 8)."""\n'
             "    import json\n"
             "    import js\n"
             "    from pyodide.ffi import to_js\n"
             f"    url = 'http://127.0.0.1:{port}/eval_ts'\n"
             "    # JSON dump the code twice: once for the payload, once for the JS string literal\n"
-            "    payload_data = json.dumps({'code': code, 'allow_net': " + repr(self.allow_net) + "})\n"
+            "    payload_data = json.dumps({'code': code, 'allow_net': "
+            + repr(self.allow_net)
+            + "})\n"
             "    options = to_js({\n"
             "        'method': 'POST',\n"
             "        'body': payload_data,\n"
@@ -733,10 +744,16 @@ class SandboxExecutor:
                 )
 
             # Start MCP bridge if needed (before pool, so port is available)
-            bridge_port = await self._ensure_mcp_bridge(self.db_pool, self.thread_id, stateful=self.stateful)
+            bridge_port = await self._ensure_mcp_bridge(
+                self.db_pool, self.thread_id, stateful=self.stateful
+            )
 
             # Ensure pool is started with MCP bridge port and network permissions
-            pool_key = await self._ensure_pool(mcp_bridge_port=bridge_port, enable_debugger=self.enable_debugger, allow_net=self.allow_net)
+            pool_key = await self._ensure_pool(
+                mcp_bridge_port=bridge_port,
+                enable_debugger=self.enable_debugger,
+                allow_net=self.allow_net,
+            )
             pool = self._pools.get(pool_key)
             if pool is None:
                 raise RuntimeError("Worker pool not available")
@@ -786,21 +803,24 @@ class SandboxExecutor:
                 final_worker_files = set()
                 worker_files_data = result.get("files")
                 if isinstance(worker_files_data, dict):
-                    for f in worker_files_data.keys():
+                    for f in worker_files_data:
                         final_worker_files.add(f if f.startswith("/") else f"/{f}")
-                
+
                 # Only perform deletion if we actually got a final file list to compare against
                 if final_worker_files:
                     for old_file in before_vfs_files:
                         # CRITICAL: Only delete if the file is in /tmp or /home
                         # Other files (like root project files) are not tracked by worker
-                        is_tracked_path = old_file.startswith("/tmp") or old_file.startswith("/home")
-                        
-                        if is_tracked_path and old_file not in final_worker_files:
-                            # Also check if it's a hidden/system file we don't want to delete
-                            if not old_file.startswith("/home/pyodide") and not old_file == "/sitecustomize.py":
-                                logger.info(f"Deleting {old_file} from VFS (deleted during execution)")
-                                await self.vfs.delete_file(old_file)
+                        is_tracked_path = old_file.startswith("/tmp") or old_file.startswith("/home")  # noqa: S108  # nosec B108  # fmt: skip
+
+                        if (
+                            is_tracked_path
+                            and old_file not in final_worker_files
+                            and not old_file.startswith("/home/pyodide")
+                            and old_file != "/sitecustomize.py"
+                        ):
+                            logger.info(f"Deleting {old_file} from VFS (deleted during execution)")
+                            await self.vfs.delete_file(old_file)
 
             execution_time = time.time() - start_time
             logger.info(
@@ -933,16 +953,22 @@ class SandboxExecutor:
             final_worker_files = set()
             worker_files_data = result.get("files")
             if isinstance(worker_files_data, dict):
-                for f in worker_files_data.keys():
+                for f in worker_files_data:
                     final_worker_files.add(f if f.startswith("/") else f"/{f}")
-            
+
             if final_worker_files:
                 for old_file in before_vfs_files:
-                    is_tracked_path = old_file.startswith("/tmp") or old_file.startswith("/home")
-                    if is_tracked_path and old_file not in final_worker_files:
-                        if not old_file.startswith("/home/pyodide") and not old_file == "/sitecustomize.py":
-                            logger.info(f"Deleting {old_file} from VFS (deleted during shell execution)")
-                            await self.vfs.delete_file(old_file)
+                    is_tracked_path = old_file.startswith("/tmp") or old_file.startswith("/home")  # noqa: S108  # nosec B108  # fmt: skip
+                    if (
+                        is_tracked_path
+                        and old_file not in final_worker_files
+                        and not old_file.startswith("/home/pyodide")
+                        and old_file != "/sitecustomize.py"
+                    ):
+                        logger.info(
+                            f"Deleting {old_file} from VFS (deleted during shell execution)"
+                        )
+                        await self.vfs.delete_file(old_file)
 
         success = bool(result.get("success", False))
         exit_code = result.get("exit_code")

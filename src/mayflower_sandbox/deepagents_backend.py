@@ -94,7 +94,7 @@ except ImportError:  # pragma: no cover - optional dependency
 
 
 from .filesystem import FileNotFoundError, InvalidPathError, VirtualFilesystem  # noqa: E402
-from .sandbox_executor import SandboxExecutor  # noqa: E402
+from .sandbox_executor import ExecutionResult, SandboxExecutor  # noqa: E402
 
 
 def _format_line_numbers(lines: list[str], start_line: int) -> str:
@@ -285,7 +285,9 @@ class PostgresBackend(BackendProtocol):
     def read(self, file_path: str, offset: int = 0, limit: int = 2000, raw: bool = False) -> str:
         return self._run_async(self.aread(file_path, offset=offset, limit=limit, raw=raw))
 
-    async def aread(self, file_path: str, offset: int = 0, limit: int = 2000, raw: bool = False) -> str:
+    async def aread(
+        self, file_path: str, offset: int = 0, limit: int = 2000, raw: bool = False
+    ) -> str:
         try:
             record = await self._vfs.read_file(file_path)
         except (FileNotFoundError, InvalidPathError):
@@ -293,7 +295,7 @@ class PostgresBackend(BackendProtocol):
 
         content_bytes = record.get("content", b"") or b""
         content = content_bytes.decode("utf-8", errors="replace")
-        
+
         if raw:
             return content
 
@@ -607,9 +609,10 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
         super().__init__(db_pool, thread_id, vfs_id=vfs_id)
         self._vfs_id = vfs_id or thread_id
         self._stateful = stateful
-        
+
         if stateful:
             from .session import StatefulExecutor
+
             self._executor = StatefulExecutor(
                 db_pool,
                 thread_id,
@@ -619,7 +622,7 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
                 timeout_seconds=timeout_seconds,
             )
         else:
-            self._executor = SandboxExecutor(
+            self._executor = SandboxExecutor(  # type: ignore[assignment]  # StatefulExecutor and SandboxExecutor share the same execute() interface
                 db_pool,
                 thread_id,
                 vfs_id=self._vfs_id,
@@ -660,50 +663,57 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
 
     async def acreate_snapshot(self, ttl_days: int = 1) -> str:
         """Create a point-in-time snapshot of the current session.
-        
+
         Args:
             ttl_days: How long the snapshot should live before auto-cleanup
-            
+
         Returns:
             New snapshot thread_id
         """
         from mayflower_sandbox.manager import SandboxManager
+
         manager = SandboxManager(self._db_pool)
         return await manager.create_snapshot(self._thread_id, ttl_days)
-        
+
     def create_snapshot(self, ttl_days: int = 1) -> str:
         """Create a point-in-time snapshot of the current session."""
         return self._run_async(self.acreate_snapshot(ttl_days))
-        
+
     async def arestore_snapshot(self, snapshot_id: str) -> None:
         """Restore the current session from a snapshot.
-        
+
         Args:
             snapshot_id: The snapshot thread_id to restore from
         """
         from mayflower_sandbox.manager import SandboxManager
+
         manager = SandboxManager(self._db_pool)
         await manager.restore_snapshot(snapshot_id, target_thread_id=self._thread_id)
-        
+
         # Reload the session record to get potentially updated vfs_id
         async with self._db_pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT vfs_id FROM sandbox_sessions WHERE thread_id = $1", self._thread_id)
+            row = await conn.fetchrow(
+                "SELECT vfs_id FROM sandbox_sessions WHERE thread_id = $1", self._thread_id
+            )
             if row:
                 self._vfs_id = row["vfs_id"] or self._thread_id
-                
+
             # Direct DB check for our test file
             fs_row = await conn.fetchrow(
                 "SELECT 1 FROM sandbox_filesystem WHERE vfs_id = $1 AND file_path = '/data.csv'",
-                self._vfs_id
+                self._vfs_id,
             )
-            logger.debug(f"DIRECT DB CHECK after restore for vfs_id={self._vfs_id}: found={fs_row is not None}")
-        
+            logger.debug(
+                f"DIRECT DB CHECK after restore for vfs_id={self._vfs_id}: found={fs_row is not None}"
+            )
+
         # Re-initialize VFS with the (potentially new) vfs_id
         self._vfs = VirtualFilesystem(self._db_pool, self._thread_id, vfs_id=self._vfs_id)
-        
+
         # Re-initialize executor to clear any stale state
         if self._stateful:
             from .session import StatefulExecutor
+
             self._executor = StatefulExecutor(
                 self._db_pool,
                 self._thread_id,
@@ -713,7 +723,7 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
                 timeout_seconds=self._timeout_seconds,
             )
         else:
-            self._executor = SandboxExecutor(
+            self._executor = SandboxExecutor(  # type: ignore[assignment]  # StatefulExecutor and SandboxExecutor share the same execute() interface
                 self._db_pool,
                 self._thread_id,
                 vfs_id=self._vfs_id,
@@ -722,7 +732,7 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
                 enable_debugger=self._executor.enable_debugger,
                 timeout_seconds=self._timeout_seconds,
             )
-        
+
     def restore_snapshot(self, snapshot_id: str) -> None:
         """Restore the current session from a snapshot."""
         return self._run_async(self.arestore_snapshot(snapshot_id))
@@ -894,18 +904,18 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
 
     def _should_route_to_pyodide(self, command: str) -> bool:
         """Robustly decide if a command should be routed to Pyodide.
-        
+
         Uses AST parsing to check if the code is valid Python, but also
         applies heuristics to avoid misrouting shell commands.
         """
         import ast
-        import textwrap
         import re
-        
+        import textwrap
+
         stripped = command.strip()
         if not stripped:
             return False
-            
+
         # Multi-line is highly likely to be Python
         if "\n" in stripped:
             # But not if it's a simple shell pipeline
@@ -914,12 +924,12 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
                 pass
             else:
                 return True
-            
+
         # Explicit Python patterns - check these BEFORE shell symbols
         # Use word boundaries to avoid matching substrings in shell commands
         if re.search(r"^(import|from|def|class|async|await|lambda)\b", stripped):
             return True
-            
+
         if "eval_ts(" in stripped:
             return True
 
@@ -940,17 +950,17 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
         try:
             dedented = textwrap.dedent(command)
             tree = ast.parse(dedented)
-            
+
             # If it's more than one statement, it's Python
             if len(tree.body) > 1:
                 return True
-                
+
             if len(tree.body) == 1:
                 node = tree.body[0]
                 # If it's an assignment (x = 1, data['x'] = 1, self.x = 1), it's Python
                 if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
                     return True
-                    
+
                 if isinstance(node, ast.Expr):
                     # Function calls or awaits are likely Python
                     if isinstance(node.value, (ast.Call, ast.Await)):
@@ -959,7 +969,7 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
                     # Common shell bare-word commands (ls, pwd, etc.) are already
                     # caught by the regex check above before we reach AST parsing.
                     return True
-                
+
                 # Control flow etc are definitely Python
                 return True
             return len(tree.body) > 0
@@ -1077,11 +1087,11 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
         output = result.stdout or ""
         if result.stderr:
             output = f"{output}\n{result.stderr}" if output else result.stderr
-        
+
         exit_code: int = 0
         if result.exit_code is not None:
             exit_code = result.exit_code
         else:
             exit_code = 0 if result.success else 1
-            
+
         return ExecuteResponse(output=output, exit_code=exit_code, truncated=False)

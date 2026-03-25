@@ -7,11 +7,8 @@ This VFS serves as the persistent layer. Files stored here will be:
 
 import logging
 import mimetypes
-import re
 from pathlib import Path
 from typing import Any
-
-
 
 logger = logging.getLogger(__name__)
 

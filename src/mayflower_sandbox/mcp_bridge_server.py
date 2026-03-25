@@ -16,9 +16,14 @@ from typing import Any
 try:
     import asyncpg
 except ImportError:
+
     class _DummyAsyncpg:
-        class UndefinedTableError(Exception): pass
-        class UndefinedColumnError(Exception): pass
+        class UndefinedTableError(Exception):
+            pass
+
+        class UndefinedColumnError(Exception):
+            pass
+
     asyncpg = _DummyAsyncpg()  # type: ignore
 
 from .mcp_bindings import MCPBindingManager
@@ -134,9 +139,17 @@ class MCPBridgeServer:
                     """,
                     self.thread_id,
                 )
-            except (asyncpg.UndefinedTableError, asyncpg.UndefinedColumnError, sqlite3.OperationalError) as e:
-                is_missing_table = isinstance(e, asyncpg.UndefinedTableError) or (isinstance(e, sqlite3.OperationalError) and "no such table" in str(e))
-                is_missing_col = isinstance(e, asyncpg.UndefinedColumnError) or (isinstance(e, sqlite3.OperationalError) and "no such column" in str(e))
+            except (
+                asyncpg.UndefinedTableError,
+                asyncpg.UndefinedColumnError,
+                sqlite3.OperationalError,
+            ) as e:
+                is_missing_table = isinstance(e, asyncpg.UndefinedTableError) or (
+                    isinstance(e, sqlite3.OperationalError) and "no such table" in str(e)
+                )
+                is_missing_col = isinstance(e, asyncpg.UndefinedColumnError) or (
+                    isinstance(e, sqlite3.OperationalError) and "no such column" in str(e)
+                )
 
                 if is_missing_col and not is_missing_table:
                     # Fall back if schemas column doesn't exist yet
@@ -150,7 +163,9 @@ class MCPBridgeServer:
                             self.thread_id,
                         )
                     except (asyncpg.UndefinedTableError, sqlite3.OperationalError) as e2:
-                        if isinstance(e2, asyncpg.UndefinedTableError) or (isinstance(e2, sqlite3.OperationalError) and "no such table" in str(e2)):
+                        if isinstance(e2, asyncpg.UndefinedTableError) or (
+                            isinstance(e2, sqlite3.OperationalError) and "no such table" in str(e2)
+                        ):
                             rows = []
                         else:
                             raise
@@ -228,11 +243,13 @@ class MCPBridgeServer:
             json.dumps({"result": result}, default=self._json_default).encode("utf-8"),
         )
 
-    async def _execute_ts_eval(self, code: str, allow_net: bool | list[str] = False) -> tuple[str, bytes]:
+    async def _execute_ts_eval(
+        self, code: str, allow_net: bool | list[str] = False
+    ) -> tuple[str, bytes]:
         """Evaluate TypeScript code via Deno (Feature 8)."""
-        import tempfile
         import os
-        
+        import tempfile
+
         # Wrap code in an async IIFE so it can use top-level await/return
         # and print the result as JSON
         wrapped_code = f"""
@@ -248,53 +265,56 @@ class MCPBridgeServer:
             }}
         }})();
         """
-        
+
         fd, temp_path = tempfile.mkstemp(suffix=".ts")
         try:
-            with os.fdopen(fd, 'w') as f:
+            with os.fdopen(fd, "w") as f:
                 f.write(wrapped_code)
-            
+
             cmd = ["deno", "run"]
             if allow_net is True:
                 cmd.append("--allow-net")
             elif isinstance(allow_net, list):
                 cmd.append(f"--allow-net={','.join(allow_net)}")
-            
+
             cmd.append(temp_path)
-            
+
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, stderr = await proc.communicate()
-            
+
             stdout_str = stdout.decode(errors="replace")
             stderr_str = stderr.decode(errors="replace")
-            
+
             # Extract JSON result if present
             result_obj = None
             if "MAYFLOWER_JSON_START" in stdout_str:
                 import re
-                match = re.search(r"MAYFLOWER_JSON_START(.*?)MAYFLOWER_JSON_END", stdout_str, re.DOTALL)
+
+                match = re.search(
+                    r"MAYFLOWER_JSON_START(.*?)MAYFLOWER_JSON_END", stdout_str, re.DOTALL
+                )
                 if match:
                     try:
                         result_obj = json.loads(match.group(1))
                         # Clean up stdout
                         stdout_str = stdout_str.replace(match.group(0), "").strip()
-                    except:
+                    except Exception:  # noqa: S110  # nosec B110
                         pass
 
             result = {
                 "success": proc.returncode == 0,
                 "stdout": stdout_str,
                 "stderr": stderr_str,
-                "result": result_obj
+                "result": result_obj,
             }
             # If Deno failed (e.g. PermissionDenied), ensure success is false even if result_obj exists
             if proc.returncode != 0:
                 result["success"] = False
-                
+
             return "200 OK", json.dumps(result).encode("utf-8")
         finally:
             if os.path.exists(temp_path):
@@ -303,6 +323,7 @@ class MCPBridgeServer:
     async def _execute_cache_package(self, data: dict) -> tuple[str, bytes]:
         """Store a package wheel in the cache (Feature 1)."""
         import base64
+
         try:
             content = base64.b64decode(data["content_b64"])
             async with self.db_pool.acquire() as conn:
@@ -319,7 +340,7 @@ class MCPBridgeServer:
                     data["version"],
                     data["pyodide_version"],
                     data["filename"],
-                    content
+                    content,
                 )
             return "200 OK", json.dumps({"success": True}).encode("utf-8")
         except Exception as e:
@@ -328,6 +349,7 @@ class MCPBridgeServer:
     async def _execute_get_cached_package(self, data: dict) -> tuple[str, bytes]:
         """Retrieve a package wheel from the cache (Feature 1)."""
         import base64
+
         try:
             async with self.db_pool.acquire() as conn:
                 row = await conn.fetchrow(
@@ -337,13 +359,13 @@ class MCPBridgeServer:
                     """,
                     data["package_name"],
                     data["version"],
-                    data["pyodide_version"]
+                    data["pyodide_version"],
                 )
                 if row:
                     result = {
                         "found": True,
                         "filename": row["filename"],
-                        "content_b64": base64.b64encode(row["content"]).decode("utf-8")
+                        "content_b64": base64.b64encode(row["content"]).decode("utf-8"),
                     }
                 else:
                     result = {"found": False}

@@ -7,7 +7,6 @@ Provides endpoints for downloading files created by sandbox executions.
 import logging
 from typing import Any
 
-
 from aiohttp import web
 
 from mayflower_sandbox.filesystem import FileNotFoundError as VFSFileNotFoundError

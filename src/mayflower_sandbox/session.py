@@ -9,8 +9,6 @@ import json
 import logging
 from typing import Any
 
-
-
 from mayflower_sandbox.manager import SandboxManager
 from mayflower_sandbox.sandbox_executor import ExecutionResult, SandboxExecutor
 
@@ -163,12 +161,12 @@ class StatefulExecutor:
         self.allow_net = allow_net
         self.enable_debugger = enable_debugger
         self.executor = SandboxExecutor(
-            db_pool, 
-            thread_id, 
+            db_pool,
+            thread_id,
             vfs_id=self.vfs_id,
-            allow_net=allow_net, 
+            allow_net=allow_net,
             enable_debugger=enable_debugger,
-            stateful=True
+            stateful=True,
         )
         self.recovery = SessionRecovery(db_pool)
         self.manager = SandboxManager(db_pool)
