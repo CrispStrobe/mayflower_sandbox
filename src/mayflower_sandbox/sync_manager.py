@@ -1,21 +1,32 @@
 """
 SyncSandboxManager — thread-safe synchronous bridge for MayflowerSandboxBackend.
 
+Design
+------
 Owns a single persistent asyncio event loop running in a background daemon thread.
 All sandbox operations are submitted via asyncio.run_coroutine_threadsafe(), which:
-  - Avoids spawning a new OS thread + event loop per call (the old approach)
-  - Keeps the aiosqlite / asyncio.to_thread pool alive and properly associated
-    with one loop for the entire process lifetime
-  - Serialises DB writes through the single loop while the Pyodide WorkerPool
-    handles execution concurrency (controlled by PYODIDE_POOL_SIZE, default 3)
 
-Usage (call once at startup, reuse the singleton):
+  - Avoids spawning a new OS thread + event loop per call
+  - Keeps the SqliteDatabase pool (asyncio.to_thread-based) in one stable loop
+  - Lets the Pyodide WorkerPool manage execution concurrency (PYODIDE_POOL_SIZE)
+
+Uses the public DeepAgents SandboxBackendProtocol API (aexecute with sentinels,
+als_info, adownload_files) — not private _executor attributes.
+
+Routing sentinels
+-----------------
+  "__PYTHON__\\n<code>"   → Pyodide WASM
+  "__SHELL__\\n<command>" → BusyBox WASM
+
+Usage (call once at startup, reuse the singleton)::
 
     from mayflower_sandbox.sync_manager import SyncSandboxManager
     manager = SyncSandboxManager("/path/to/sandbox_vfs.db")
 
-    stdout, stderr, exit_code = manager.execute("print(2+2)", thread_id="user_1")
-    stdout, stderr, exit_code = manager.execute("ls /home", thread_id="user_1", is_shell=True)
+    output, exit_code = manager.execute("print(2+2)", thread_id="user_1")
+    output, exit_code = manager.execute("ls /home", thread_id="user_1", is_shell=True)
+    files = manager.list_files(thread_id="user_1", path="/home")
+    content = manager.download_file(thread_id="user_1", path="/home/plot.png")
 """
 
 from __future__ import annotations
@@ -23,20 +34,24 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    pass
+    from .deepagents_backend import FileInfo
 
 logger = logging.getLogger(__name__)
+
+_PYTHON_SENTINEL = "__PYTHON__"
+_SHELL_SENTINEL = "__SHELL__"
 
 
 class SyncSandboxManager:
     """Thread-safe synchronous wrapper around MayflowerSandboxBackend.
 
     One instance should be created at application startup and reused for the
-    lifetime of the process.  Multiple threads may call ``execute()`` concurrently;
-    requests are dispatched through a single persistent asyncio event loop.
+    lifetime of the process.  Multiple threads may call ``execute()``
+    concurrently; requests are dispatched through the single persistent loop.
     """
 
     def __init__(
@@ -45,13 +60,6 @@ class SyncSandboxManager:
         allow_net: bool = False,
         timeout_seconds: float = 60.0,
     ) -> None:
-        """Create the manager and start the background event loop.
-
-        Args:
-            db_path: Path to the sandbox SQLite database file.
-            allow_net: Whether sandbox code may make network calls (default False).
-            timeout_seconds: Default execution timeout per call.
-        """
         self._db_path = db_path
         self._allow_net = allow_net
         self._timeout_seconds = timeout_seconds
@@ -65,10 +73,9 @@ class SyncSandboxManager:
         )
         self._thread.start()
 
-        # Initialise the SQLite pool inside the persistent loop
         future = asyncio.run_coroutine_threadsafe(self._init_pool(), self._loop)
         future.result(timeout=30)
-        logger.info(f"SyncSandboxManager ready (db={db_path!r})")
+        logger.info("SyncSandboxManager ready (db=%r)", db_path)
 
     # ------------------------------------------------------------------
     # Internal loop management
@@ -79,8 +86,27 @@ class SyncSandboxManager:
         self._loop.run_forever()
 
     async def _init_pool(self) -> None:
-        from .db import create_sqlite_pool  # local import — optional dep
+        from .db import create_sqlite_pool
         self._pool = await create_sqlite_pool(self._db_path)
+
+    def _submit(self, coro, timeout: float):
+        """Submit a coroutine to the persistent loop and block until done."""
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        try:
+            return future.result(timeout=timeout)
+        except TimeoutError:
+            future.cancel()
+            raise
+
+    def _make_backend(self, thread_id: str, timeout: float):
+        from .deepagents_backend import MayflowerSandboxBackend
+        return MayflowerSandboxBackend(
+            self._pool,
+            thread_id=thread_id,
+            allow_net=self._allow_net,
+            stateful=True,
+            timeout_seconds=timeout,
+        )
 
     # ------------------------------------------------------------------
     # Public sync API
@@ -92,62 +118,74 @@ class SyncSandboxManager:
         thread_id: str,
         timeout: float | None = None,
         is_shell: bool = False,
-    ) -> tuple[str, str, int]:
-        """Execute code synchronously. Safe to call from any thread.
-
-        Args:
-            code: Python code or shell command to run.
-            thread_id: Per-user isolation key (e.g. ``"user_42"``).
-            timeout: Execution timeout in seconds; falls back to the constructor default.
-            is_shell: If True, run as BusyBox shell command instead of Python.
+    ) -> tuple[str, int]:
+        """Execute code in the sandbox. Thread-safe, uses protocol sentinels.
 
         Returns:
-            Tuple of (stdout, stderr, exit_code).
+            (output, exit_code) where output is combined stdout+stderr.
         """
         t = timeout if timeout is not None else self._timeout_seconds
-        future = asyncio.run_coroutine_threadsafe(
-            self._aexecute(code, thread_id, t, is_shell),
-            self._loop,
-        )
+        sentinel = _SHELL_SENTINEL if is_shell else _PYTHON_SENTINEL
+        command = f"{sentinel}\n{code}"
         try:
-            return future.result(timeout=t + 10)
+            res = self._submit(
+                self._aexecute(command, thread_id, t),
+                timeout=t + 10,
+            )
+            return res.output or "", res.exit_code
         except TimeoutError:
-            future.cancel()
-            return "", f"Timeout nach {t:.0f}s", -1
+            return f"Timeout nach {t:.0f}s", -1
         except Exception as exc:
-            return "", f"Sandbox-Fehler: {exc}", 1
+            return f"Sandbox-Fehler: {exc}", 1
 
-    # ------------------------------------------------------------------
-    # Async implementation (runs inside the persistent loop)
-    # ------------------------------------------------------------------
-
-    async def _aexecute(
+    def list_files(
         self,
-        code: str,
         thread_id: str,
-        timeout: float,
-        is_shell: bool,
-    ) -> tuple[str, str, int]:
-        from .deepagents_backend import MayflowerSandboxBackend  # local import
+        path: str = "/home",
+    ) -> list["FileInfo"]:
+        """List files in the sandbox VFS. Returns FileInfo list (empty on error)."""
+        try:
+            return self._submit(
+                self._alist_files(thread_id, path),
+                timeout=15,
+            )
+        except Exception as exc:
+            logger.warning("list_files failed for %s: %s", thread_id, exc)
+            return []
 
-        backend = MayflowerSandboxBackend(
-            self._pool,
-            thread_id=thread_id,
-            allow_net=self._allow_net,
-            stateful=True,
-            timeout_seconds=timeout,
-        )
-        if is_shell:
-            res = await backend._executor.execute_shell(code)
-        else:
-            res = await backend._executor.execute(code)
+    def download_file(
+        self,
+        thread_id: str,
+        path: str,
+    ) -> bytes | None:
+        """Download a file from the sandbox VFS. Returns None on error."""
+        try:
+            return self._submit(
+                self._adownload_file(thread_id, path),
+                timeout=30,
+            )
+        except Exception as exc:
+            logger.warning("download_file failed for %s %s: %s", thread_id, path, exc)
+            return None
 
-        stdout = (getattr(res, "stdout", None) or "")[:4000]
-        stderr = (getattr(res, "stderr", None) or "")[:1000]
-        exit_code = getattr(res, "exit_code", None)
-        if exit_code is None:
-            exit_code = 0 if getattr(res, "success", True) else 1
-        return stdout, stderr, exit_code
+    # ------------------------------------------------------------------
+    # Async implementations (run inside the persistent loop)
+    # ------------------------------------------------------------------
+
+    async def _aexecute(self, command: str, thread_id: str, timeout: float):
+        backend = self._make_backend(thread_id, timeout)
+        return await backend.aexecute(command)
+
+    async def _alist_files(self, thread_id: str, path: str):
+        backend = self._make_backend(thread_id, self._timeout_seconds)
+        return await backend.als_info(path)
+
+    async def _adownload_file(self, thread_id: str, path: str) -> bytes | None:
+        backend = self._make_backend(thread_id, self._timeout_seconds)
+        results = await backend.adownload_files([path])
+        if results and results[0].content:
+            return results[0].content
+        return None
 
     # ------------------------------------------------------------------
     # Cleanup
