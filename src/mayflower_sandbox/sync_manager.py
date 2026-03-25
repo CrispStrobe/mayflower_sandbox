@@ -54,16 +54,28 @@ class SyncSandboxManager:
     concurrently; requests are dispatched through the single persistent loop.
     """
 
+    # Packages that are bundled with Pyodide but not auto-loaded.
+    # Installed once per thread_id on first use; persisted in the thread's VFS.
+    DEFAULT_PREINSTALL: tuple[str, ...] = (
+        "numpy", "matplotlib", "pandas", "scipy", "pillow",
+    )
+
     def __init__(
         self,
         db_path: str,
         allow_net: bool = False,
         timeout_seconds: float = 60.0,
+        preinstall: tuple[str, ...] | None = None,
     ) -> None:
         self._db_path = db_path
         self._allow_net = allow_net
         self._timeout_seconds = timeout_seconds
         self._pool: object = None
+        self._preinstall: tuple[str, ...] = (
+            preinstall if preinstall is not None else self.DEFAULT_PREINSTALL
+        )
+        self._warmed_threads: set[str] = set()
+        self._warm_lock: asyncio.Lock | None = None  # created inside the loop
 
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(
@@ -88,6 +100,7 @@ class SyncSandboxManager:
     async def _init_pool(self) -> None:
         from .db import create_sqlite_pool
         self._pool = await create_sqlite_pool(self._db_path)
+        self._warm_lock = asyncio.Lock()
 
     def _submit(self, coro, timeout: float):
         """Submit a coroutine to the persistent loop and block until done."""
@@ -172,7 +185,37 @@ class SyncSandboxManager:
     # Async implementations (run inside the persistent loop)
     # ------------------------------------------------------------------
 
+    async def _ensure_warmed(self, thread_id: str) -> None:
+        """Install bundled Pyodide packages on first use of a thread.
+
+        Packages are written into the thread's VFS so subsequent calls find
+        them already installed without re-running micropip.
+        """
+        if not self._preinstall or thread_id in self._warmed_threads:
+            return
+        async with self._warm_lock:
+            if thread_id in self._warmed_threads:
+                return  # another coroutine beat us here
+            pkgs = list(self._preinstall)
+            install_code = (
+                "__PYTHON__\n"
+                "import micropip as _mp\n"
+                f"await _mp.install({pkgs!r}, keep_going=True)\n"
+                "del _mp"
+            )
+            logger.info("Pre-installing %s for thread %r …", pkgs, thread_id)
+            backend = self._make_backend(thread_id, 120.0)
+            try:
+                await backend.aexecute(install_code)
+                self._warmed_threads.add(thread_id)
+                logger.info("Pre-install done for thread %r", thread_id)
+            except Exception as exc:
+                logger.warning("Pre-install failed for thread %r: %s", thread_id, exc)
+                # Mark as warmed anyway so we don't retry on every call
+                self._warmed_threads.add(thread_id)
+
     async def _aexecute(self, command: str, thread_id: str, timeout: float):
+        await self._ensure_warmed(thread_id)
         backend = self._make_backend(thread_id, timeout)
         return await backend.aexecute(command)
 
