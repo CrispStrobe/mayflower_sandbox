@@ -119,20 +119,18 @@ if _site_str not in sys.path:
 
 async def write_bootstrap_files(vfs) -> None:
     """
-    Write bootstrap files into the thread's VFS.
-
-    Writes:
-    - /site-packages/mayflower_mcp.py: Low-level MCP call wrapper
-    - /site-packages/maistack_tools.py: Convenience wrappers for MAI Stack tools
-
-    'vfs' is the repo's VirtualFilesystem instance.
+    Write bootstrap files into the thread's VFS if missing.
     """
     site = SITE_PACKAGES_PATH
-    await vfs.write_file(str(site / "mayflower_mcp.py"), MCP_SHIM.encode("utf-8"))
-    await vfs.write_file(str(site / "maistack_tools.py"), MAISTACK_TOOLS_SHIM.encode("utf-8"))
-
-    # Ensure /site-packages is on sys.path via standard sitecustomize hook.
-    # Avoid overwriting existing customization if present.
+    mcp_path = str(site / "mayflower_mcp.py")
+    maistack_path = str(site / "maistack_tools.py")
     sitecustomize_path = "/sitecustomize.py"
+
+    if not await vfs.file_exists(mcp_path):
+        await vfs.write_file(mcp_path, MCP_SHIM.encode("utf-8"))
+    
+    if not await vfs.file_exists(maistack_path):
+        await vfs.write_file(maistack_path, MAISTACK_TOOLS_SHIM.encode("utf-8"))
+
     if not await vfs.file_exists(sitecustomize_path):
         await vfs.write_file(sitecustomize_path, SITE_PACKAGES_INIT.encode("utf-8"))

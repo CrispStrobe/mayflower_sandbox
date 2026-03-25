@@ -79,6 +79,9 @@ async function restoreSession(
   pyodide: any,
   sessionBytes: number[],
 ): Promise<void> {
+  const startSize = sessionBytes.length;
+  console.error(`[Memory] Restoring session (${(startSize / 1024 / 1024).toFixed(2)} MB)...`);
+
   await pyodide.runPythonAsync(`
 try:
     import cloudpickle
@@ -91,11 +94,12 @@ except ImportError:
   await pyodide.runPythonAsync(`
 import json
 import micropip
+import sys
+import gc
 
 _session_bytes = bytes(${JSON.stringify(Array.from(sessionBytes))})
 
 # Pre-install common modules often found in pickled sessions to avoid errors
-# during cloudpickle.loads before we can even catch the exception.
 for _m in ['numpy', 'matplotlib', 'pandas']:
     try:
         import importlib
@@ -104,32 +108,35 @@ for _m in ['numpy', 'matplotlib', 'pandas']:
         await micropip.install(_m)
 
 # Attempt to load the session, installing missing modules as needed
-for _retry in range(5):  # hard cap on recursive dependency resolution
+_session_obj = {}
+for _retry in range(5):
     try:
         _session_obj = cloudpickle.loads(_session_bytes)
         break
     except (ModuleNotFoundError, Exception) as e:
-        # If it's a ModuleNotFoundError, try to install the missing package
         if hasattr(e, 'name') and e.name:
             _pkg = e.name.split('.')[0]
             await micropip.install(_pkg)
         else:
-            # For other errors or if package name is missing, we stop
             raise
 
-# Clear all user-defined names before applying session to prevent state
-# from a previous thread's execution leaking into this session.
-_skip = frozenset({'_session_bytes', '_session_obj', '_skip', 'cloudpickle', 'micropip', 'json', 'importlib'})
+# Clear all user-defined names
+_skip = frozenset({'_session_bytes', '_session_obj', '_skip', 'cloudpickle', 'micropip', 'json', 'importlib', 'gc'})
 for _k in [k for k in list(globals()) if not k.startswith('__') and k not in _skip]:
-    del globals()[_k]
+    if _k in globals():
+        del globals()[_k]
 globals().pop('_k', None)
 globals().update(_session_obj)
 
-# Cleanup helper vars safely
-for _v in ['_session_bytes', '_session_obj', '_skip', '_retry', '_pkg', '_m']:
+# Cleanup helper vars
+for _v in ['_session_bytes', '_session_obj', '_skip', '_retry', '_pkg', '_m', 'importlib']:
     globals().pop(_v, None)
-del _v
+gc.collect()
 `);
+
+  if (pyodide.collectGarbage) {
+    pyodide.collectGarbage();
+  }
 }
 
 /**
@@ -138,20 +145,47 @@ del _v
 async function saveSession(pyodide: any): Promise<number[]> {
   const sessionBytesResult = await pyodide.runPythonAsync(`
 import types
+import sys
+import gc
 _globals_snapshot = dict(globals())
 _session_dict = {}
+_skipped_vars = []
+
 for k, v in _globals_snapshot.items():
     if k.startswith('_'):
+        continue
+    # Skip modules (they should be re-imported in next turn)
+    if isinstance(v, types.ModuleType):
         continue
     if isinstance(v, type) and v.__module__ == 'builtins':
         continue
     if hasattr(v, 'read') or hasattr(v, 'write'):
         continue
-    # Filter out JsProxy objects which break cloudpickle
     if v.__class__.__name__ == 'JsProxy':
         continue
+    
+    # Heuristic to avoid pickling massive data structures (> 2MB)
+    # which cause MemoryError on restore in the limited Pyodide heap.
+    try:
+        if hasattr(v, 'nbytes') and v.nbytes > 2 * 1024 * 1024:
+            _skipped_vars.append(f"{k} ({v.nbytes / 1024 / 1024:.1f}MB)")
+            continue
+    except:
+        pass
+
     _session_dict[k] = v
-list(cloudpickle.dumps(_session_dict))
+
+if _skipped_vars:
+    print(f"DEBUG: Skipped large variables during session save: {', '.join(_skipped_vars)}", file=sys.stderr)
+
+_bytes = list(cloudpickle.dumps(_session_dict))
+_size = len(_bytes)
+if _size > 5 * 1024 * 1024:
+    print(f"DEBUG: Large session state detected: {_size / 1024 / 1024:.2f} MB", file=sys.stderr)
+
+del _globals_snapshot, _session_dict, _skipped_vars
+gc.collect()
+_bytes
 `);
   return sessionBytesResult.toJs();
 }

@@ -392,26 +392,25 @@ class SandboxExecutor:
             return
 
         helpers_dir = Path(__file__).parent / "helpers"
-
         if not helpers_dir.exists():
-            logger.warning(f"Helpers directory not found at {helpers_dir}")
             self._helpers_loaded = True
             return
 
+        # Get existing files to avoid redundant writes
+        existing_files = {f["file_path"] for f in await self.vfs.list_files("/home/pyodide/%")}
+
         helper_count = 0
         for py_file in helpers_dir.rglob("*.py"):
-            # Calculate VFS path maintaining directory structure
             rel_path = py_file.relative_to(helpers_dir)
             vfs_path = f"/home/pyodide/{rel_path}"
 
-            # Read file content
-            content = py_file.read_bytes()
+            if vfs_path not in existing_files:
+                content = py_file.read_bytes()
+                await self.vfs.write_file(vfs_path, content)
+                helper_count += 1
 
-            # Write to VFS (persists across executions)
-            await self.vfs.write_file(vfs_path, content)
-            helper_count += 1
-
-        logger.info(f"Preloaded {helper_count} helper modules into VFS for thread {self.thread_id}")
+        if helper_count > 0:
+            logger.info(f"Preloaded {helper_count} new helper modules into VFS")
         self._helpers_loaded = True
 
     async def _get_mcp_server_configs(self) -> dict[str, dict[str, Any]]:

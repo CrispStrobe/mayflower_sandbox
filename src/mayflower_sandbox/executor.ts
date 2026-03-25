@@ -113,7 +113,7 @@ except ImportError:
 
   await pyodide.runPythonAsync(`
 import micropip
-
+import gc
 _session_bytes = bytes(${JSON.stringify(Array.from(sessionBytes))})
 
 # Pre-install common modules often found in pickled sessions
@@ -125,7 +125,8 @@ for _m in ['numpy', 'matplotlib', 'pandas']:
         await micropip.install(_m)
 
 # Attempt to load the session, installing missing modules as needed
-for _retry in range(5):  # hard cap on recursive dependency resolution
+_session_obj = {}
+for _retry in range(5):
     try:
         _session_obj = cloudpickle.loads(_session_bytes)
         break
@@ -141,8 +142,12 @@ globals().update(_session_obj)
 # Cleanup helper vars safely
 for _v in ['_session_bytes', '_session_obj', '_retry', '_pkg', '_m', 'importlib']:
     globals().pop(_v, None)
-del _v
+gc.collect()
 `);
+
+  if (pyodide.collectGarbage) {
+    pyodide.collectGarbage();
+  }
 }
 
 /**
@@ -151,17 +156,34 @@ del _v
 async function saveSession(pyodide: any): Promise<number[]> {
   const sessionBytesResult = await pyodide.runPythonAsync(`
 import types
+import sys
+import gc
 _globals_snapshot = dict(globals())
 _session_dict = {}
 for k, v in _globals_snapshot.items():
     if k.startswith('_'):
         continue
+    # Skip modules
+    if isinstance(v, types.ModuleType):
+        continue
     if isinstance(v, type) and v.__module__ == 'builtins':
         continue
     if hasattr(v, 'read') or hasattr(v, 'write'):
         continue
+    
+    # Avoid pickling massive data structures (> 2MB)
+    try:
+        if hasattr(v, 'nbytes') and v.nbytes > 2 * 1024 * 1024:
+            continue
+    except:
+        pass
+
     _session_dict[k] = v
-list(cloudpickle.dumps(_session_dict))
+
+_bytes = list(cloudpickle.dumps(_session_dict))
+del _globals_snapshot, _session_dict
+gc.collect()
+_bytes
 `);
   return sessionBytesResult.toJs();
 }

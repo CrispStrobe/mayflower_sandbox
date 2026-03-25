@@ -874,6 +874,12 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
         output = result.stdout or ""
         if result.stderr:
             output = f"{output}\n{result.stderr}" if output else result.stderr
+
+        # Include result if stdout is empty
+        if result.result is not None and not result.stdout:
+            res_str = str(result.result)
+            output = f"{output}\n{res_str}" if output else res_str
+
         py_exit_code = 0 if result.success else 1
         self._store_pending_files(result)
         return ExecuteResponse(output=output, exit_code=py_exit_code, truncated=False)
@@ -884,6 +890,12 @@ class MayflowerSandboxBackend(PostgresBackend, SandboxBackendProtocol):
         output = result.stdout or ""
         if result.stderr:
             output = f"{output}\n{result.stderr}" if output else result.stderr
+
+        # Include result if stdout is empty
+        if result.result is not None and not result.stdout:
+            res_str = str(result.result)
+            output = f"{output}\n{res_str}" if output else res_str
+
         py_exit_code = 0 if result.success else 1
         await self._astore_pending_files(result)
         return ExecuteResponse(output=output, exit_code=py_exit_code, truncated=False)
